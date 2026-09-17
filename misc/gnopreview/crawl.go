@@ -22,9 +22,20 @@ type page struct {
 	Body string
 }
 
+// noindexTag keeps previews out of search results. Every snapshot page is a
+// near-duplicate of a real gno.land page, so an indexed preview competes with
+// the site it is a copy of — and outlives the pull request in the index.
+//
+// A meta tag rather than robots.txt: a path disallowed in robots.txt can still
+// be indexed from an external link, and being disallowed is exactly what stops
+// a crawler from ever reading the noindex. Allow the crawl, refuse the index.
+const noindexTag = `<meta name="robots" content="noindex, nofollow">`
+
 var (
-	attrRe = regexp.MustCompile(`(?i)\b(href|src)="([^"]*)"`)
-	cssRe  = regexp.MustCompile(`url\(\s*"?(/public/[^)"']*)"?\s*\)`)
+	headRe   = regexp.MustCompile(`(?i)<head[^>]*>`)
+	robotsRe = regexp.MustCompile(`(?i)<meta\s+name="robots"[^>]*>`)
+	attrRe   = regexp.MustCompile(`(?i)\b(href|src)="([^"]*)"`)
+	cssRe    = regexp.MustCompile(`url\(\s*"?(/public/[^)"']*)"?\s*\)`)
 )
 
 // Crawler snapshots a running gnoweb into a self-contained static tree.
@@ -33,6 +44,12 @@ type Crawler struct {
 	Realms   []string // package paths that may be followed
 	MaxPages int
 	Live     string // absolute origin for links we did not capture
+	// RenderOnly captures just each realm's render page and follows nothing.
+	// Used for the "before" pass, where only the rendered output is compared.
+	RenderOnly bool
+	// Prefix is prepended to every output path, so a second crawl of the same
+	// realms can live beside the first (the "before" tree under _before/).
+	Prefix string
 
 	pages map[string]*page // url -> page
 	order []string
@@ -53,14 +70,19 @@ func (c *Crawler) Seeds() []string {
 	for _, r := range c.Realms {
 		u := urlOf(r)
 		add(u)
+		if c.RenderOnly {
+			continue
+		}
 		add(u + "$source")
 		add(u + "$help")
 		for d := path.Dir(u); d != "/" && d != "."; d = path.Dir(d) {
 			dirs[d] = true
 		}
 	}
-	for _, d := range sortedKeys(dirs) {
-		add(d)
+	if !c.RenderOnly {
+		for _, d := range sortedKeys(dirs) {
+			add(d)
+		}
 	}
 	return out
 }
@@ -96,7 +118,7 @@ func (c *Crawler) Run() error {
 			fmt.Fprintf(os.Stderr, "  ! %s: HTTP %d\n", u, code)
 			continue
 		}
-		p := &page{URL: u, File: urlToFile(u), Body: body}
+		p := &page{URL: u, File: path.Join(c.Prefix, urlToFile(u)), Body: body}
 		c.pages[u] = p
 		c.order = append(c.order, u)
 		fmt.Printf("  ✓ %s\n", u)
@@ -132,6 +154,9 @@ var explosiveArgs = map[string]bool{
 // query ($source&file=a.gno) are part of the same page family, so they are
 // followed; anything else is left to the live site.
 func (c *Crawler) inScope(p string) bool {
+	if c.RenderOnly {
+		return false
+	}
 	base, args, query := splitURL(p)
 	// $source and $help do not depend on the render arguments, so ":x$source"
 	// is a byte-for-byte copy of "$source". Keep the render view of each
@@ -188,6 +213,9 @@ func canonicalURL(p string) string {
 // rewritten: to a relative path when we captured the target, to the live site
 // otherwise. assets is the repo's gnoweb public/ dir, copied verbatim.
 func (c *Crawler) Write(dir, assets string) error {
+	if assets == "" { // a prefixed crawl reuses the assets already written
+		return c.writePages(dir)
+	}
 	n, err := copyTree(assets, filepath.Join(dir, "public"))
 	if err != nil {
 		return fmt.Errorf("copy assets: %w", err)
@@ -204,6 +232,10 @@ func (c *Crawler) Write(dir, assets string) error {
 			return err
 		}
 	}
+	return c.writePages(dir)
+}
+
+func (c *Crawler) writePages(dir string) error {
 	for _, u := range c.order {
 		p := c.pages[u]
 		out := filepath.Join(dir, filepath.FromSlash(p.File))
@@ -214,6 +246,15 @@ func (c *Crawler) Write(dir, assets string) error {
 	return nil
 }
 
+// FileOf returns where a captured URL was written, relative to the output dir.
+func (c *Crawler) FileOf(u string) (string, bool) {
+	p, ok := c.pages[canonicalURL(u)]
+	if !ok {
+		return "", false
+	}
+	return p.File, true
+}
+
 // rewrite maps every absolute URL in a page to something that resolves from the
 // page's own directory in the static tree.
 func (c *Crawler) rewrite(p *page) string {
@@ -221,7 +262,8 @@ func (c *Crawler) rewrite(p *page) string {
 	depth := len(strings.Split(strings.Trim(path.Dir(p.File), "/"), "/"))
 	up := strings.Repeat("../", depth)
 
-	body := attrRe.ReplaceAllStringFunc(p.Body, func(m string) string {
+	body := setNoindex(p.Body)
+	body = attrRe.ReplaceAllStringFunc(body, func(m string) string {
 		sub := attrRe.FindStringSubmatch(m)
 		attr, raw := sub[1], sub[2]
 		return fmt.Sprintf(`%s="%s"`, attr, html.EscapeString(c.mapURL(html.UnescapeString(raw), up)))
@@ -230,6 +272,21 @@ func (c *Crawler) rewrite(p *page) string {
 		sub := cssRe.FindStringSubmatch(m)
 		return "url(" + up + strings.TrimPrefix(sub[1], "/") + ")"
 	})
+}
+
+// setNoindex makes a captured page unindexable. gnoweb's own layout emits
+// `<meta name="robots" content="index, follow">` on every page, so this
+// REPLACES that tag rather than adding a second one: two conflicting robots
+// directives leave the outcome to each crawler's precedence rules, and the
+// correct one is not worth betting the gno.land search results on.
+func setNoindex(body string) string {
+	if robotsRe.MatchString(body) {
+		return robotsRe.ReplaceAllString(body, noindexTag)
+	}
+	if loc := headRe.FindStringIndex(body); loc != nil {
+		return body[:loc[1]] + noindexTag + body[loc[1]:]
+	}
+	return noindexTag + body
 }
 
 // mapURL is the single place that decides where a link points in the snapshot.
