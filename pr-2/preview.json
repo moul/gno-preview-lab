@@ -10,5 +10,13 @@
   "dropped": 0,
   "dirs": [
     "examples/gno.land/r/gnoland/home"
+  ],
+  "pairs": [
+    {
+      "realm": "gno.land/r/gnoland/home",
+      "before": "_shots/r-gnoland-home-before.png",
+      "after": "_shots/r-gnoland-home-after.png",
+      "url": "r/gnoland/home/"
+    }
   ]
 }
