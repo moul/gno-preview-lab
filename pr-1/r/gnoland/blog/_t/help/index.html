@@ -35,16 +35,16 @@
   <link rel="icon" href="../../../../../public/favicon.ico" type="image/x-icon" />
 
   
-  <meta name="robots" content="index, follow" />
+  <meta name="robots" content="noindex, nofollow">
 
   
   <link rel="stylesheet" href="../../../../../public/_chroma/style.css" />
 
   
-  <link rel="stylesheet" href="../../../../../public/main.css?v=20260917102818" />
+  <link rel="stylesheet" href="../../../../../public/main.css?v=20260917113543" />
 
   
-  <meta name="gnoconnect:rpc" content="tcp://127.0.0.1:26657" />
+  <meta name="gnoconnect:rpc" content="tcp://127.0.0.1:18899" />
   <meta name="gnoconnect:chainid" content="dev" />
 </head>
 <body>
@@ -477,7 +477,7 @@
               </svg>
               <div class="item-content">
                 <span class="item-label">RPC Address</span>
-                <span class="item-value">tcp://127.0.0.1:26657</span>
+                <span class="item-value">tcp://127.0.0.1:18899</span>
               </div>
             </div>
           </div>
@@ -851,10 +851,10 @@
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AddComment" -args $'<span data-action-function-target="arg" data-action-function-arg-value="postSlug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="comment"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AddComment" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AddComment" -args $'<span data-action-function-target="arg" data-action-function-arg-value="postSlug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="comment"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AddComment" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AddComment" -args $'<span data-action-function-target="arg" data-action-function-arg-value="postSlug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="comment"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -959,10 +959,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminAddModerator" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AdminAddModerator" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminAddModerator" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AdminAddModerator" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminAddModerator" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -1067,10 +1067,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminRemoveModerator" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AdminRemoveModerator" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminRemoveModerator" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AdminRemoveModerator" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminRemoveModerator" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -1175,10 +1175,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminSetAdminAddr" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AdminSetAdminAddr" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminSetAdminAddr" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AdminSetAdminAddr" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminSetAdminAddr" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -1283,10 +1283,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminSetInPause" -args $'<span data-action-function-target="arg" data-action-function-arg-value="state"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AdminSetInPause" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminSetInPause" -args $'<span data-action-function-target="arg" data-action-function-arg-value="state"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AdminSetInPause" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "AdminSetInPause" -args $'<span data-action-function-target="arg" data-action-function-arg-value="state"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -1391,10 +1391,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModAddCommenter" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModAddCommenter" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModAddCommenter" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModAddCommenter" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModAddCommenter" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -1549,10 +1549,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModAddPost" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="title"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="body"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="publicationDate"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="authors"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="tags"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModAddPost" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModAddPost" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="title"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="body"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="publicationDate"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="authors"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="tags"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModAddPost" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModAddPost" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="title"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="body"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="publicationDate"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="authors"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="tags"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -1667,10 +1667,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModDelComment" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="index"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModDelComment" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModDelComment" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="index"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModDelComment" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModDelComment" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="index"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -1775,10 +1775,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModDelCommenter" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModDelCommenter" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModDelCommenter" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModDelCommenter" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModDelCommenter" -args $'<span data-action-function-target="arg" data-action-function-arg-value="addr"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -1933,10 +1933,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModEditPost" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="title"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="body"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="publicationDate"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="authors"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="tags"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModEditPost" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModEditPost" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="title"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="body"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="publicationDate"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="authors"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="tags"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModEditPost" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModEditPost" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="title"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="body"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="publicationDate"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="authors"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="tags"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -2041,10 +2041,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModRemovePost" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModRemovePost" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModRemovePost" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-ModRemovePost" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "ModRemovePost" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -2199,10 +2199,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "NewPostProposalRequest" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="title"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="body"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="publicationDate"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="authors"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="tags"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-NewPostProposalRequest" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "NewPostProposalRequest" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="title"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="body"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="publicationDate"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="authors"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="tags"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-NewPostProposalRequest" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/gnoland/blog" -func "NewPostProposalRequest" -args $'<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="title"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="body"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="publicationDate"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="authors"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="tags"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -2293,7 +2293,7 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
         </button>
         
         
-        <pre><code><span data-copy-target="action-function-PostExists">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:26657</span>" -data "gno.land/r/gnoland/blog.PostExists(<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>)"</span></code></pre>
+        <pre><code><span data-copy-target="action-function-PostExists">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:18899</span>" -data "gno.land/r/gnoland/blog.PostExists(<span data-action-function-target="arg" data-action-function-arg-value="slug"></span>)"</span></code></pre>
         
         
       </div>
@@ -2388,7 +2388,7 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
         </button>
         
         
-        <pre><code><span data-copy-target="action-function-Render">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:26657</span>" -data "gno.land/r/gnoland/blog.Render(<span data-action-function-target="arg" data-action-function-arg-value="path"></span>)"</span></code></pre>
+        <pre><code><span data-copy-target="action-function-Render">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:18899</span>" -data "gno.land/r/gnoland/blog.Render(<span data-action-function-target="arg" data-action-function-arg-value="path"></span>)"</span></code></pre>
         
         
       </div>
@@ -2483,7 +2483,7 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
         </button>
         
         
-        <pre><code><span data-copy-target="action-function-RenderLastPostsWidget">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:26657</span>" -data "gno.land/r/gnoland/blog.RenderLastPostsWidget(<span data-action-function-target="arg" data-action-function-arg-value="limit"></span>)"</span></code></pre>
+        <pre><code><span data-copy-target="action-function-RenderLastPostsWidget">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:18899</span>" -data "gno.land/r/gnoland/blog.RenderLastPostsWidget(<span data-action-function-target="arg" data-action-function-arg-value="limit"></span>)"</span></code></pre>
         
         
       </div>
@@ -2611,7 +2611,7 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 </footer>
 
 
-<script type="module" src="../../../../../public/js/controller.js?v=20260917102818"></script>
-<script type="module" src="../../../../../public/js/index.js?v=20260917102818"></script></body>
+<script type="module" src="../../../../../public/js/controller.js?v=20260917113543"></script>
+<script type="module" src="../../../../../public/js/index.js?v=20260917113543"></script></body>
 
 </html>
