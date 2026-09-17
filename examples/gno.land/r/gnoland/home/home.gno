@@ -31,7 +31,7 @@ func Render(_ string) string {
 		return strconv.Itoa(int(runtime.ChainHeight()))
 	})
 
-	template := `# Welcome to Gno.land
+	template := `# Welcome to Gno.land — PREVIEW LAB
 
 We're building Gno.land, set to become the leading open-source smart contract
 platform, using Gno, an interpreted and fully deterministic variation of the
@@ -80,7 +80,7 @@ Explore this ready-to-use Gno dApp, and experience decentralized social media in
 
 <gno-columns-sep>
 
-## Explore the universe
+## Explore the universe (and this heading was edited by the PR)
 
 - [Discover demo packages](https://github.com/gnolang/gno/tree/master/examples)
 - [Gnoscan](https://gnoscan.io)
