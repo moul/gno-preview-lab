@@ -80,7 +80,7 @@ Explore this ready-to-use Gno dApp, and experience decentralized social media in
 
 <gno-columns-sep>
 
-## Explore the universe
+## Explore the universe (and this heading was edited by the PR)
 
 - [Discover demo packages](https://github.com/gnolang/gno/tree/master/examples)
 - [Gnoscan](https://gnoscan.io)
