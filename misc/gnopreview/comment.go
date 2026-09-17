@@ -104,9 +104,13 @@ func pairGrid(pairs []ShotPair, base string) string {
 	for _, p := range pairs {
 		b.WriteString(fmt.Sprintf("**`%s`**\n\n", p.Realm))
 		if p.Before == "" {
+			note := ""
+			if p.New {
+				note = "\n\n<sub>New in this PR — nothing to compare against.</sub>"
+			}
 			b.WriteString(fmt.Sprintf(
-				`<a href="%s/%s"><img src="%s/%s" width="600" alt="%s"></a>`+"\n\n<sub>New in this PR — nothing to compare against.</sub>\n\n",
-				base, p.URL, base, p.After, p.Realm))
+				`<a href="%s/%s"><img src="%s/%s" width="600" alt="%s"></a>`+"%s\n\n",
+				base, p.URL, base, p.After, p.Realm, note))
 			continue
 		}
 		b.WriteString("<table><tr>")
@@ -174,7 +178,7 @@ func Index(p *Plan, c *Crawler) string {
 	return fmt.Sprintf(`<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex">
+<meta name="robots" content="noindex, nofollow">
 <title>gnoweb preview</title>
 <style>
  :root{color-scheme:light dark}

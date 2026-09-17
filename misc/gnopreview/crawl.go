@@ -22,9 +22,20 @@ type page struct {
 	Body string
 }
 
+// noindexTag keeps previews out of search results. Every snapshot page is a
+// near-duplicate of a real gno.land page, so an indexed preview competes with
+// the site it is a copy of — and outlives the pull request in the index.
+//
+// A meta tag rather than robots.txt: a path disallowed in robots.txt can still
+// be indexed from an external link, and being disallowed is exactly what stops
+// a crawler from ever reading the noindex. Allow the crawl, refuse the index.
+const noindexTag = `<meta name="robots" content="noindex, nofollow">`
+
 var (
-	attrRe = regexp.MustCompile(`(?i)\b(href|src)="([^"]*)"`)
-	cssRe  = regexp.MustCompile(`url\(\s*"?(/public/[^)"']*)"?\s*\)`)
+	headRe   = regexp.MustCompile(`(?i)<head[^>]*>`)
+	robotsRe = regexp.MustCompile(`(?i)<meta\s+name="robots"[^>]*>`)
+	attrRe   = regexp.MustCompile(`(?i)\b(href|src)="([^"]*)"`)
+	cssRe    = regexp.MustCompile(`url\(\s*"?(/public/[^)"']*)"?\s*\)`)
 )
 
 // Crawler snapshots a running gnoweb into a self-contained static tree.
@@ -251,7 +262,8 @@ func (c *Crawler) rewrite(p *page) string {
 	depth := len(strings.Split(strings.Trim(path.Dir(p.File), "/"), "/"))
 	up := strings.Repeat("../", depth)
 
-	body := attrRe.ReplaceAllStringFunc(p.Body, func(m string) string {
+	body := setNoindex(p.Body)
+	body = attrRe.ReplaceAllStringFunc(body, func(m string) string {
 		sub := attrRe.FindStringSubmatch(m)
 		attr, raw := sub[1], sub[2]
 		return fmt.Sprintf(`%s="%s"`, attr, html.EscapeString(c.mapURL(html.UnescapeString(raw), up)))
@@ -260,6 +272,21 @@ func (c *Crawler) rewrite(p *page) string {
 		sub := cssRe.FindStringSubmatch(m)
 		return "url(" + up + strings.TrimPrefix(sub[1], "/") + ")"
 	})
+}
+
+// setNoindex makes a captured page unindexable. gnoweb's own layout emits
+// `<meta name="robots" content="index, follow">` on every page, so this
+// REPLACES that tag rather than adding a second one: two conflicting robots
+// directives leave the outcome to each crawler's precedence rules, and the
+// correct one is not worth betting the gno.land search results on.
+func setNoindex(body string) string {
+	if robotsRe.MatchString(body) {
+		return robotsRe.ReplaceAllString(body, noindexTag)
+	}
+	if loc := headRe.FindStringIndex(body); loc != nil {
+		return body[:loc[1]] + noindexTag + body[loc[1]:]
+	}
+	return noindexTag + body
 }
 
 // mapURL is the single place that decides where a link points in the snapshot.
