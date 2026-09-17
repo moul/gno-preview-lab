@@ -52,6 +52,7 @@ func Comment(p *Plan, baseURL, pr string) string {
 			b.WriteString("\n")
 			b.WriteString(shotGrid(p.Shots, base))
 		}
+		b.WriteString(pairGrid(p.Pairs, base))
 		direct := map[string]bool{}
 		for _, r := range p.ChangedRealms {
 			direct[r] = true
@@ -89,6 +90,38 @@ func Comment(p *Plan, baseURL, pr string) string {
 		b.WriteString(fmt.Sprintf(" Rebuilt on every push to this PR; removed when PR #%s closes.", pr))
 	}
 	b.WriteString("</sub>\n")
+	return b.String()
+}
+
+// pairGrid shows each changed realm as the merge base renders it and as this
+// branch renders it, side by side. Both columns come from the same gnoweb, so
+// the difference is the realm change.
+func pairGrid(pairs []ShotPair, base string) string {
+	if len(pairs) == 0 || base == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, p := range pairs {
+		b.WriteString(fmt.Sprintf("**`%s`**\n\n", p.Realm))
+		if p.Before == "" {
+			note := ""
+			if p.New {
+				note = "\n\n<sub>New in this PR — nothing to compare against.</sub>"
+			}
+			b.WriteString(fmt.Sprintf(
+				`<a href="%s/%s"><img src="%s/%s" width="600" alt="%s"></a>`+"%s\n\n",
+				base, p.URL, base, p.After, p.Realm, note))
+			continue
+		}
+		b.WriteString("<table><tr>")
+		b.WriteString(fmt.Sprintf(
+			`<td width="50%%"><img src="%s/%s" width="100%%" alt="%s before"><br><sub>before — merge base</sub></td>`,
+			base, p.Before, p.Realm))
+		b.WriteString(fmt.Sprintf(
+			`<td width="50%%"><a href="%s/%s"><img src="%s/%s" width="100%%" alt="%s after"></a><br><sub><b>after — this PR</b></sub></td>`,
+			base, p.URL, base, p.After, p.Realm))
+		b.WriteString("</tr></table>\n\n")
+	}
 	return b.String()
 }
 
@@ -145,7 +178,7 @@ func Index(p *Plan, c *Crawler) string {
 	return fmt.Sprintf(`<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex">
+<meta name="robots" content="noindex, nofollow">
 <title>gnoweb preview</title>
 <style>
  :root{color-scheme:light dark}

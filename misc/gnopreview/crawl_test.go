@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -147,6 +148,35 @@ func TestURLOf(t *testing.T) {
 	} {
 		if got := urlOf(tc.in); got != tc.want {
 			t.Errorf("urlOf(%q) = %q; want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestRewriteAddsNoindex(t *testing.T) {
+	t.Parallel()
+	c := &Crawler{Live: "https://gno.land", pages: map[string]*page{}}
+	for _, tc := range []struct{ name, body string }{
+		{"normal head", `<!doctype html><html><head><title>x</title></head><body>hi</body></html>`},
+		{"head with attrs", `<html><head lang="en"><title>x</title></head></html>`},
+		// A page gnoweb serves without a <head> (an error view, say) must still
+		// carry the tag rather than silently become indexable.
+		{"no head", `<p>fragment</p>`},
+		// gnoweb's own layout ships this on every page; it must be replaced,
+		// not joined by a second, contradicting tag.
+		{"gnoweb's index,follow", `<html><head><meta name="robots" content="index, follow" /><title>x</title></head></html>`},
+	} {
+		got := c.rewrite(&page{File: "r/x/index.html", Body: tc.body})
+		if !strings.Contains(got, noindexTag) {
+			t.Errorf("%s: rewrite dropped the noindex tag: %s", tc.name, got)
+		}
+		if n := strings.Count(got, noindexTag); n != 1 {
+			t.Errorf("%s: noindex tag appears %d times, want 1", tc.name, n)
+		}
+		if n := strings.Count(strings.ToLower(got), `<meta name="robots"`); n != 1 {
+			t.Errorf("%s: %d robots metas, want exactly 1 — conflicting directives", tc.name, n)
+		}
+		if strings.Contains(got, "index, follow") {
+			t.Errorf("%s: gnoweb's index,follow survived: %s", tc.name, got)
 		}
 	}
 }
