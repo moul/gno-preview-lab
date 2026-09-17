@@ -1,0 +1,14 @@
+{
+  "gnoweb": false,
+  "changed_realms": [
+    "gno.land/r/gnoland/home"
+  ],
+  "changed_pkgs": null,
+  "realms": [
+    "gno.land/r/gnoland/home"
+  ],
+  "dropped": 0,
+  "dirs": [
+    "examples/gno.land/r/gnoland/home"
+  ]
+}
