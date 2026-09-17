@@ -1,0 +1,565 @@
+package vm
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/gnolang/gno/tm2/pkg/amino"
+	"github.com/gnolang/gno/tm2/pkg/crypto"
+	"github.com/gnolang/gno/tm2/pkg/std"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestMsgAddPackage_ValidateBasic(t *testing.T) {
+	t.Parallel()
+
+	creator := crypto.AddressFromPreimage([]byte("addr1"))
+	pkgName := "test"
+	pkgPath := "gno.land/r/namespace/test"
+	files := []*std.MemFile{
+		{
+			Name: "test.gno",
+			Body: `package test
+		func Echo() string {return "hello world"}`,
+		},
+	}
+
+	tests := []struct {
+		name            string
+		msg             MsgAddPackage
+		expectSignBytes string
+		expectErr       error
+	}{
+		{
+			name:            "valid message",
+			msg:             NewMsgAddPackage(creator, pkgPath, files),
+			expectSignBytes: `{"creator":"g14ch5q26mhx3jk5cxl88t278nper264ces4m8nt","max_deposit":"","package":{"files":[{"body":"package test\n\t\tfunc Echo() string {return \"hello world\"}","name":"test.gno"}],"name":"test","path":"gno.land/r/namespace/test"},"send":""}`,
+			expectErr:       nil,
+		},
+		{
+			name: "missing creator address",
+			msg: MsgAddPackage{
+				Creator: crypto.Address{},
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  pkgPath,
+					Files: files,
+				},
+				MaxDeposit: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: std.InvalidAddressError{},
+		},
+		{
+			name: "missing package path",
+			msg: MsgAddPackage{
+				Creator: creator,
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  "",
+					Files: files,
+				},
+				MaxDeposit: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: InvalidPkgPathError{},
+		},
+		{
+			name: "invalid deposit coins",
+			msg: MsgAddPackage{
+				Creator: creator,
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  pkgPath,
+					Files: files,
+				},
+				MaxDeposit: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: -1000, // invalid amount
+				}},
+			},
+			expectErr: std.InvalidCoinsError{},
+		},
+		{
+			name: "invalid Send coins",
+			msg: MsgAddPackage{
+				Creator: creator,
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  pkgPath,
+					Files: files,
+				},
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: -1000,
+				}},
+			},
+			expectErr: std.InvalidCoinsError{},
+		},
+		{
+			name: "invalid MaxDeposit coins",
+			msg: MsgAddPackage{
+				Creator: creator,
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  pkgPath,
+					Files: files,
+				},
+				MaxDeposit: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: -1000,
+				}},
+			},
+			expectErr: std.InvalidCoinsError{},
+		},
+		{
+			name: "empty files array",
+			msg: MsgAddPackage{
+				Creator: creator,
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  pkgPath,
+					Files: []*std.MemFile{},
+				},
+			},
+			expectErr: InvalidFileError{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := tc.msg.ValidateBasic(); err != nil {
+				assert.ErrorIs(t, err, tc.expectErr)
+			} else {
+				assert.Equal(t, tc.expectSignBytes, string(tc.msg.GetSignBytes()))
+			}
+		})
+	}
+}
+
+func TestMsgCall_ValidateBasic(t *testing.T) {
+	t.Parallel()
+
+	caller := crypto.AddressFromPreimage([]byte("addr1"))
+	pkgPath := "gno.land/r/namespace/test"
+	funcName := "MyFunction"
+	args := []string{"arg1", "arg2"}
+
+	tests := []struct {
+		name            string
+		msg             MsgCall
+		expectSignBytes string
+		expectErr       error
+	}{
+		{
+			name: "valid message",
+			msg:  NewMsgCall(caller, std.NewCoins(std.NewCoin("ugnot", 1000)), pkgPath, funcName, args),
+			expectSignBytes: `{"args":["arg1","arg2"],"caller":"g14ch5q26mhx3jk5cxl88t278nper264ces4m8nt",` +
+				`"func":"MyFunction","max_deposit":"","pkg_path":"gno.land/r/namespace/test","send":"1000ugnot"}`,
+			expectErr: nil,
+		},
+		{
+			name: "invalid caller address",
+			msg: MsgCall{
+				Caller:  crypto.Address{},
+				PkgPath: pkgPath,
+				Func:    funcName,
+				Args:    args,
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: std.InvalidAddressError{},
+		},
+		{
+			name: "missing package path",
+			msg: MsgCall{
+				Caller:  caller,
+				PkgPath: "",
+				Func:    funcName,
+				Args:    args,
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: InvalidPkgPathError{},
+		},
+		{
+			name: "pkgPath should not be a realm path",
+			msg: MsgCall{
+				Caller:  caller,
+				PkgPath: "gno.land/p/namespace/test", // this is not a valid realm path
+				Func:    funcName,
+				Args:    args,
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: InvalidPkgPathError{},
+		},
+		{
+			name: "pkgPath should not be an internal path",
+			msg: MsgCall{
+				Caller:  caller,
+				PkgPath: "gno.land/r/demo/avl/internal/sort",
+				Func:    funcName,
+				Args:    args,
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: InvalidPkgPathError{},
+		},
+		{
+			name: "missing function name to call",
+			msg: MsgCall{
+				Caller:  caller,
+				PkgPath: pkgPath,
+				Func:    "",
+				Args:    args,
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: InvalidExprError{},
+		},
+		{
+			name: "func name with injected expression",
+			msg: MsgCall{
+				Caller:  caller,
+				PkgPath: pkgPath,
+				Func:    "Foo()+huge",
+				Args:    args,
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: InvalidExprError{},
+		},
+		{
+			name: "func name with selector chain",
+			msg: MsgCall{
+				Caller:  caller,
+				PkgPath: pkgPath,
+				Func:    "Foo.Bar",
+				Args:    args,
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: InvalidExprError{},
+		},
+		{
+			name: "func name starting with digit",
+			msg: MsgCall{
+				Caller:  caller,
+				PkgPath: pkgPath,
+				Func:    "1Foo",
+				Args:    args,
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: InvalidExprError{},
+		},
+		{
+			name: "invalid Send coins",
+			msg: MsgCall{
+				Caller:  caller,
+				PkgPath: pkgPath,
+				Func:    funcName,
+				Args:    []string{},
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: -1000,
+				}},
+			},
+			expectErr: std.InvalidCoinsError{},
+		},
+		{
+			name: "invalid MaxDeposit coins",
+			msg: MsgCall{
+				Caller:  caller,
+				PkgPath: pkgPath,
+				Func:    funcName,
+				Args:    []string{},
+				MaxDeposit: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: -1000,
+				}},
+			},
+			expectErr: std.InvalidCoinsError{},
+		},
+		{
+			name: "empty arguments",
+			msg: MsgCall{
+				Caller:  caller,
+				PkgPath: pkgPath,
+				Func:    funcName,
+				Args:    []string{},
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectSignBytes: `{"caller":"g14ch5q26mhx3jk5cxl88t278nper264ces4m8nt","func":"MyFunction","max_deposit":"","pkg_path":"gno.land/r/namespace/test","send":"1000ugnot"}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := tc.msg.ValidateBasic(); err != nil {
+				assert.ErrorIs(t, err, tc.expectErr)
+			} else {
+				assert.Equal(t, tc.expectSignBytes, string(tc.msg.GetSignBytes()))
+			}
+		})
+	}
+}
+
+func TestMsgRun_ValidateBasic(t *testing.T) {
+	t.Parallel()
+
+	caller := crypto.AddressFromPreimage([]byte("addr1"))
+	pkgName := "main"
+	pkgPath := "gno.land/e/" + caller.String() + "/run"
+	pkgFiles := []*std.MemFile{
+		{
+			Name: "main.gno",
+			Body: `package main
+		func Echo() string {return "hello world"}`,
+		},
+	}
+
+	tests := []struct {
+		name            string
+		msg             MsgRun
+		expectSignBytes string
+		expectErr       error
+	}{
+		{
+			name:            "valid message",
+			msg:             NewMsgRun(caller, std.NewCoins(std.NewCoin("ugnot", 1000)), pkgFiles),
+			expectSignBytes: `{"caller":"g14ch5q26mhx3jk5cxl88t278nper264ces4m8nt","max_deposit":"","package":{"files":[{"body":"package main\n\t\tfunc Echo() string {return \"hello world\"}","name":"main.gno"}],"name":"main","path":""},"send":"1000ugnot"}`,
+			expectErr:       nil,
+		},
+		{
+			name: "invalid caller address",
+			msg: MsgRun{
+				Caller: crypto.Address{},
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  pkgPath,
+					Files: pkgFiles,
+				},
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: std.InvalidAddressError{},
+		},
+		{
+			name: "invalid package path",
+			msg: MsgRun{
+				Caller: caller,
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  "gno.land/r/namespace/test", // this is not a valid run path
+					Files: pkgFiles,
+				},
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: InvalidPkgPathError{},
+		},
+		{
+			name: "invalid Send coins",
+			msg: MsgRun{
+				Caller: caller,
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  pkgPath,
+					Files: pkgFiles,
+				},
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: -1000,
+				}},
+			},
+			expectErr: std.InvalidCoinsError{},
+		},
+		{
+			name: "invalid MaxDeposit coins",
+			msg: MsgRun{
+				Caller: caller,
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  pkgPath,
+					Files: pkgFiles,
+				},
+				MaxDeposit: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: -1000,
+				}},
+			},
+			expectErr: std.InvalidCoinsError{},
+		},
+		{
+			name: "empty package files",
+			msg: MsgRun{
+				Caller: caller,
+				Package: &std.MemPackage{
+					Name:  pkgName,
+					Path:  pkgPath,
+					Files: []*std.MemFile{},
+				},
+				Send: std.Coins{std.Coin{
+					Denom:  "ugnot",
+					Amount: 1000,
+				}},
+			},
+			expectErr: InvalidFileError{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := tc.msg.ValidateBasic(); err != nil {
+				assert.ErrorIs(t, err, tc.expectErr)
+			} else {
+				assert.Equal(t, tc.expectSignBytes, string(tc.msg.GetSignBytes()))
+			}
+		})
+	}
+}
+
+// TestMsgEnablePackage covers the message contract for the inert-flow enable
+// message, which had no direct test.
+//
+// Approver is the whole authorization -- the keeper checks it against
+// params.PkgApprovers -- so GetSigners returning it is what makes the ante
+// verify the right signature. A wrong answer there is not a formatting bug.
+func TestMsgEnablePackage(t *testing.T) {
+	t.Parallel()
+
+	approver := crypto.AddressFromPreimage([]byte("approver"))
+	const path = "gno.land/r/demo/foo"
+
+	t.Run("ValidateBasic", func(t *testing.T) {
+		t.Parallel()
+
+		for _, tc := range []struct {
+			name     string
+			approver crypto.Address
+			path     string
+			wantErr  string
+		}{
+			{"both present", approver, path, ""},
+			{"missing approver", crypto.Address{}, path, "missing approver address"},
+			{"missing path", approver, "", "missing package path"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				err := MsgEnablePackage{Approver: tc.approver, PkgPath: tc.path}.ValidateBasic()
+				if tc.wantErr == "" {
+					assert.NoError(t, err)
+					return
+				}
+				require.Error(t, err)
+				// The detail lives in the wrapped trace, not in Error(): these
+				// errors format as the generic "invalid address error" and
+				// "invalid package path". Asserting on Error() alone would not
+				// distinguish which field was missing.
+				assert.Contains(t, fmt.Sprintf("%+v", err), tc.wantErr)
+			})
+		}
+	})
+
+	t.Run("GetSigners is the approver", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Equal(t, []crypto.Address{approver},
+			MsgEnablePackage{Approver: approver, PkgPath: path}.GetSigners())
+	})
+
+	t.Run("GetSignBytes covers both fields", func(t *testing.T) {
+		t.Parallel()
+
+		base := MsgEnablePackage{Approver: approver, PkgPath: path}
+		otherPath := MsgEnablePackage{Approver: approver, PkgPath: path + "bar"}
+		otherApprover := MsgEnablePackage{
+			Approver: crypto.AddressFromPreimage([]byte("someone else")),
+			PkgPath:  path,
+		}
+
+		// If a field were left out of the sign bytes, a signature over one
+		// message would be valid for another -- so changing either field must
+		// change what gets signed.
+		assert.NotEqual(t, base.GetSignBytes(), otherPath.GetSignBytes(),
+			"the package path must be covered by the signature")
+		assert.NotEqual(t, base.GetSignBytes(), otherApprover.GetSignBytes(),
+			"the approver must be covered by the signature")
+		assert.Equal(t, base.GetSignBytes(), MsgEnablePackage{
+			Approver: approver, PkgPath: path,
+		}.GetSignBytes(), "and the same message must sign identically")
+	})
+
+	t.Run("route and type", func(t *testing.T) {
+		t.Parallel()
+
+		// The ante handler and the session deny-list both key off these.
+		assert.Equal(t, "vm", MsgEnablePackage{}.Route())
+		assert.Equal(t, "enable_package", MsgEnablePackage{}.Type())
+	})
+
+	t.Run("every field survives the wire", func(t *testing.T) {
+		t.Parallel()
+
+		// A field the BINARY encoding drops is not a cosmetic bug: the signer
+		// signs GetSignBytes (JSON) over the full message, the node recomputes
+		// it from what it decoded, and the two differ -- so the transaction is
+		// rejected as "signature verification failed; verify correct account,
+		// sequence, and chain-id", naming none of the three.
+		//
+		// The binary path is generated (pb3_gen.go, `make -C misc/genproto2`),
+		// so adding a field to this struct without regenerating produces
+		// exactly that. PkgHeight shipped that way until an integration test
+		// caught it.
+		msg := MsgEnablePackage{
+			Approver:  approver,
+			PkgPath:   path,
+			PkgHash:   "deadbeef",
+			PkgHeight: 999,
+		}
+		bz, err := amino.Marshal(msg)
+		require.NoError(t, err)
+		var back MsgEnablePackage
+		require.NoError(t, amino.Unmarshal(bz, &back))
+		assert.Equal(t, msg, back)
+		assert.Equal(t, msg.GetSignBytes(), back.GetSignBytes(),
+			"what the node verifies must be what the approver signed")
+	})
+}

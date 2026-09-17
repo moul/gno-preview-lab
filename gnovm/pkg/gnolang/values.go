@@ -1,0 +1,3460 @@
+package gnolang
+
+import (
+	"encoding/binary"
+	"fmt"
+	"math/big"
+	"reflect"
+	"strings"
+	"unsafe"
+
+	"github.com/gnolang/gno/gnovm/pkg/gnolang/internal/softfloat"
+	"github.com/gnolang/gno/tm2/pkg/crypto"
+	"github.com/gnolang/gno/tm2/pkg/store/types"
+)
+
+// ----------------------------------------
+// (runtime) Value
+
+type Value interface {
+	assertValue()
+	String() string // for debugging
+
+	// DeepFill returns the same value, filled.
+	//
+	// NOTE NOT LAZY (and potentially expensive)
+	// DeepFill() is only used for synchronous recursive
+	// filling before running genstd generated native bindings
+	// which use Gno2GoValue().  All other filling functionality is
+	// lazy, so avoid using this, and keep the logic lazy.
+	//
+	// NOTE must use the return value since PointerValue isn't a pointer
+	// receiver, and RefValue returns another type entirely.
+	DeepFill(store Store) Value
+
+	GetShallowSize() int64
+	VisitAssociated(vis Visitor) (stop bool) // for GC
+}
+
+// Fixed size primitive types are represented in TypedValue.N
+// for performance.
+func (StringValue) assertValue()       {}
+func (BigintValue) assertValue()       {}
+func (BigdecValue) assertValue()       {}
+func (DataByteValue) assertValue()     {}
+func (PointerValue) assertValue()      {}
+func (*ArrayValue) assertValue()       {}
+func (*SliceValue) assertValue()       {}
+func (*StructValue) assertValue()      {}
+func (*FuncValue) assertValue()        {}
+func (*MapValue) assertValue()         {}
+func (*BoundMethodValue) assertValue() {}
+func (TypeValue) assertValue()         {}
+func (*PackageValue) assertValue()     {}
+func (*Block) assertValue()            {}
+func (RefValue) assertValue()          {}
+func (*HeapItemValue) assertValue()    {}
+
+const (
+	nilStr       = "nil"
+	undefinedStr = "undefined"
+)
+
+var (
+	_ Value = StringValue("")
+	_ Value = BigintValue{}
+	_ Value = BigdecValue{}
+	_ Value = DataByteValue{}
+	_ Value = PointerValue{}
+	_ Value = &ArrayValue{}
+	_ Value = &SliceValue{}
+	_ Value = &StructValue{}
+	_ Value = &FuncValue{}
+	_ Value = &MapValue{}
+	_ Value = &BoundMethodValue{}
+	_ Value = TypeValue{}
+	_ Value = &PackageValue{}
+	_ Value = &Block{}
+	_ Value = RefValue{}
+	_ Value = &HeapItemValue{}
+)
+
+// ----------------------------------------
+// StringValue
+
+type StringValue string
+
+// ----------------------------------------
+// BigintValue
+
+type BigintValue struct {
+	V *big.Int
+}
+
+func (biv BigintValue) MarshalAmino() (string, error) {
+	bz, err := biv.V.MarshalText()
+	if err != nil {
+		return "", err
+	}
+	return string(bz), nil
+}
+
+func (biv *BigintValue) UnmarshalAmino(s string) error {
+	vv := big.NewInt(0)
+	err := vv.UnmarshalText([]byte(s))
+	if err != nil {
+		return err
+	}
+	biv.V = vv
+	return nil
+}
+
+func (biv BigintValue) Copy(alloc *Allocator) BigintValue {
+	return BigintValue{V: big.NewInt(0).Set(biv.V)}
+}
+
+// ----------------------------------------
+// BigdecValue
+
+// BigdecFloatPrec is the mantissa precision (in bits) used for the big.Float
+// fallback representation, matching go/constant's 512-bit precision.
+const BigdecFloatPrec = 512
+
+// bigdecFloatMarshalPrefix distinguishes float-form BigdecValue in the amino
+// text wire format. A rat-form value is a plain "a/b" or integer string; a
+// float-form value is prefixed so UnmarshalAmino can tell them apart.
+const bigdecFloatMarshalPrefix = "f:"
+
+// BigdecValue holds an untyped bigdec constant in one of two representations:
+// an exact rational (V) for values that fit within ratGuard's bit limits, or
+// a bounded-precision big.Float (F) that gracefully handles extreme exponents.
+// Exactly one of V or F is non-nil for a well-formed value. The float form
+// mirrors go/constant, which switches from big.Rat to a 512-bit big.Float
+// past the same 4096-bit threshold.
+type BigdecValue struct {
+	V *big.Rat
+	F *big.Float
+}
+
+// IsFloat reports whether the value is held in big.Float form.
+func (bdv BigdecValue) IsFloat() bool { return bdv.F != nil }
+
+// AsFloat returns the value as a *big.Float, promoting from V if needed.
+// The returned value is a fresh copy; the receiver is not modified.
+func (bdv BigdecValue) AsFloat() *big.Float {
+	if bdv.F != nil {
+		return new(big.Float).SetPrec(BigdecFloatPrec).Set(bdv.F)
+	}
+	if bdv.V == nil {
+		return new(big.Float).SetPrec(BigdecFloatPrec)
+	}
+	return new(big.Float).SetPrec(BigdecFloatPrec).SetRat(bdv.V)
+}
+
+// NewBigdecFromRat wraps r as a rat-form BigdecValue.
+func NewBigdecFromRat(r *big.Rat) BigdecValue {
+	return BigdecValue{V: r}
+}
+
+// NewBigdecFromFloat wraps f as a float-form BigdecValue.
+func NewBigdecFromFloat(f *big.Float) BigdecValue {
+	return BigdecValue{F: f}
+}
+
+// Sign returns -1, 0, or +1 depending on the sign of the value.
+func (bdv BigdecValue) Sign() int {
+	if bdv.F != nil {
+		return bdv.F.Sign()
+	}
+	if bdv.V == nil {
+		return 0
+	}
+	return bdv.V.Sign()
+}
+
+// IsInt reports whether the value is an exact integer (i.e. safe to convert
+// to a bigint / typed integer). Float-form values are considered integer
+// only when they represent an exact integer.
+func (bdv BigdecValue) IsInt() bool {
+	if bdv.F != nil {
+		return bdv.F.IsInt()
+	}
+	if bdv.V == nil {
+		return true
+	}
+	return bdv.V.IsInt()
+}
+
+// IsZero reports whether the value is exactly zero.
+func (bdv BigdecValue) IsZero() bool {
+	if bdv.F != nil {
+		return bdv.F.Sign() == 0
+	}
+	if bdv.V == nil {
+		return true
+	}
+	return bdv.V.Sign() == 0
+}
+
+func (bdv BigdecValue) MarshalAmino() (string, error) {
+	if bdv.F != nil {
+		// 'p' format is an exact hexadecimal float representation; round-trips
+		// losslessly through big.Float.Parse.
+		return bigdecFloatMarshalPrefix + bdv.F.Text('p', 0), nil
+	}
+	if bdv.V == nil {
+		return "0", nil
+	}
+	return bdv.V.RatString(), nil
+}
+
+func (bdv *BigdecValue) UnmarshalAmino(s string) error {
+	if strings.HasPrefix(s, bigdecFloatMarshalPrefix) {
+		f, _, err := big.ParseFloat(s[len(bigdecFloatMarshalPrefix):], 0, BigdecFloatPrec, big.ToNearestEven)
+		if err != nil {
+			return fmt.Errorf("invalid BigdecValue (float form): %q: %w", s, err)
+		}
+		bdv.F = f
+		bdv.V = nil
+		return nil
+	}
+	r := new(big.Rat)
+	if _, ok := r.SetString(s); !ok {
+		return fmt.Errorf("invalid BigdecValue: %q", s)
+	}
+	bdv.V = r
+	bdv.F = nil
+	return nil
+}
+
+func (bdv BigdecValue) Copy(alloc *Allocator) BigdecValue {
+	if bdv.F != nil {
+		return BigdecValue{F: new(big.Float).SetPrec(BigdecFloatPrec).Set(bdv.F)}
+	}
+	if bdv.V == nil {
+		return BigdecValue{}
+	}
+	return BigdecValue{V: new(big.Rat).Set(bdv.V)}
+}
+
+// ----------------------------------------
+// DataByteValue
+
+type DataByteValue struct {
+	Base     *ArrayValue // base array.
+	Index    int         // base.Data index.
+	ElemType Type        // is Uint8Kind.
+}
+
+func (dbv DataByteValue) GetByte() byte {
+	return dbv.Base.Data[dbv.Index]
+}
+
+func (dbv DataByteValue) SetByte(b byte) {
+	dbv.Base.Data[dbv.Index] = b
+}
+
+// ----------------------------------------
+// PointerValue
+
+// *(PointerValue.TypedValue) must have already become initialized, namely T
+// set if a typed-nil.  Index is -1 for the shared "_" block var, and -2 for
+// (gno and native) map items.
+//
+// A pointer constructed via a &x{} composite lit expression or constructed via
+// new() or make() will have a virtual HeapItemValue as base.
+//
+// The Base is only nil for references to certain values that cannot
+// be modified anyways, such as top level functions.
+//
+// Allocation for PointerValue is not immediate, as usually PointerValues are
+// temporary for assignment or binary operations. When a pointer is to be
+// allocated, *Allocator.AllocatePointer() is called separately, as in OpRef.
+//
+// Since PointerValue is used internally for assignment etc, it MUST stay
+// minimal for computational efficiency.
+//
+// Equality (isEql) reduces to (Base, Index): equal iff Base and Index match,
+// the same for every element type, with no zero-sized special case. For the
+// divergence from Go, see docs/resources/gno-memory-model.md § Pointer equality.
+type PointerValue struct {
+	TV    *TypedValue // &Base[Index] or &Base.Index.
+	Base  Value       // array/struct/block, or heapitem.
+	Index int         // list/fields/values index, or -1 or -2 (see below).
+}
+
+const (
+	PointerIndexBlockBlank = -1 // for the "_" identifier in blocks
+	PointerIndexMap        = -2 // Base is Map, use Key.
+)
+
+func (pv *PointerValue) GetBase(store Store) Object {
+	switch cbase := pv.Base.(type) {
+	case nil:
+		return nil
+	case RefValue:
+		base := store.GetObject(cbase.ObjectID)
+		pv.Base = base
+		return base
+	case Object:
+		return cbase
+	default:
+		panic(fmt.Sprintf("unexpected pointer base type %T", cbase))
+	}
+}
+
+// assertBaseNotPoisoned panics if this pointer's Base is a runtime block that
+// has been returned to Machine's block pool. Reaching here means a pointer
+// into a recycled block was followed — a use-after-recycle that escape
+// analysis should have prevented by heap-promoting the local (see
+// Machine.releaseBlock). Compiled out unless the debugAssert build tag is set;
+// blocks are only ever marked poisoned under that same tag.
+func (pv PointerValue) assertBaseNotPoisoned() {
+	if b, ok := pv.Base.(*Block); ok && b.poisoned {
+		panic("gnovm: dereferenced a pointer into a recycled block; escape analysis should have heap-promoted this local")
+	}
+}
+
+// cu: convert untyped; pass false for const definitions
+// TODO: document as something that enables into-native assignment.
+// TODO: maybe consider this as entrypoint for DataByteValue too?
+func (pv PointerValue) Assign2(m *Machine, alloc *Allocator, store Store, rlm *Realm, tv2 TypedValue, cu bool) {
+	if debugAssert {
+		pv.assertBaseNotPoisoned()
+	}
+	// Special cases.
+	if pv.TV.T == DataByteType {
+		// Special case of DataByte into (base=*SliceValue).Data.
+		pv.TV.SetDataByte(tv2.GetUint8())
+		if pv.Base != nil {
+			rlm.DidUpdate(m, pv.Base.(Object), nil, nil)
+		}
+		return
+	}
+	// General case
+	oo1 := pv.TV.GetFirstObject(store)
+	pv.TV.Assign(alloc, tv2, cu)
+	oo2 := pv.TV.GetFirstObject(store)
+	if pv.Base != nil {
+		rlm.DidUpdate(m, pv.Base.(Object), oo1, oo2)
+	}
+}
+
+func (pv PointerValue) Deref() (tv TypedValue) {
+	if debugAssert {
+		pv.assertBaseNotPoisoned()
+	}
+	if pv.TV.T == DataByteType {
+		dbv := pv.TV.V.(DataByteValue)
+		tv.T = dbv.ElemType
+		tv.SetUint8(dbv.GetByte())
+		return
+	} else {
+		tv = *pv.TV
+		return
+	}
+}
+
+// ----------------------------------------
+// ArrayValue
+
+type ArrayValue struct {
+	ObjectInfo
+	List []TypedValue
+	Data []byte
+}
+
+// NOTE: Result should not be written to,
+// behavior is unexpected when .List bytes.
+func (av *ArrayValue) GetReadonlyBytes() []byte {
+	if av.Data == nil {
+		// NOTE: we cannot convert to .Data type bytearray here
+		// because there might be references to .List[x].
+		bz := make([]byte, len(av.List))
+		for i, tv := range av.List {
+			if tv.T.Kind() != Uint8Kind {
+				panic(fmt.Sprintf(
+					"expected byte kind but got %v",
+					tv.T.Kind(),
+				))
+			}
+			bz[i] = tv.GetUint8()
+		}
+		return bz
+	}
+	return av.Data
+}
+
+func (av *ArrayValue) GetCapacity() int {
+	if av.Data == nil {
+		// not cap(av.List) for simplicity.
+		// extra capacity is ignored.
+		return len(av.List)
+	}
+	// not cap(av.Data) for simplicity.
+	// extra capacity is ignored.
+	return len(av.Data)
+}
+
+func (av *ArrayValue) GetLength() int {
+	if av.Data == nil {
+		return len(av.List)
+	}
+	return len(av.Data)
+}
+
+// et is only required for .List byte-arrays.
+func (av *ArrayValue) GetElementPointer(store Store, ii int, et Type) PointerValue {
+	if ii < 0 {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf("runtime error: index out of range [%d]", ii))})
+	}
+	if av.Data == nil {
+		if ii >= len(av.List) {
+			panic(&Exception{Value: typedRuntimeError(fmt.Sprintf("runtime error: index out of range [%d] with length %d", ii, len(av.List)))})
+		}
+		ev := fillValueTV(store, &av.List[ii]) // by reference
+		return PointerValue{
+			TV:    ev,
+			Base:  av,
+			Index: ii,
+		}
+	}
+	if ii >= len(av.Data) {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf("runtime error: index out of range [%d] with length %d", ii, len(av.Data)))})
+	}
+	// heap alloc, so need to compare value rather than pointer.
+	// If you Deref the result, TypedValue.GetByteAtIndexInt is more efficient.
+	btv := &TypedValue{
+		T: DataByteType,
+		V: DataByteValue{
+			Base:     av,
+			Index:    ii,
+			ElemType: et,
+		},
+	}
+
+	return PointerValue{
+		TV:    btv,
+		Base:  av,
+		Index: ii,
+	}
+}
+
+// Copy duplicates an existing ArrayValue. Authority is type-driven, matching
+// the split rule in stampPkgID (PR #5706): if the array type is /r/-declared,
+// the copy is stamped with that /r/ owner; otherwise the fresh currentRealmID
+// stamp from NewListArray/NewDataArray stands, so the copy belongs to the
+// realm doing the copying.
+//
+// Previously this method propagated the source's runtime PkgID whenever it
+// was an /r/ PkgID. That leaked foreign authority into /p/-typed copies
+// produced by value-assignments like `*z = *x` (e.g. uint256 Set), causing
+// `cannot directly modify readonly tainted object` panics when a /r/ realm
+// performed in-place arithmetic on a /p/-typed value handed in from another
+// /r/. See https://github.com/gnolang/gno/issues/5736.
+func (av *ArrayValue) Copy(alloc *Allocator, t Type) *ArrayValue {
+	/* TODO: consider second ref count field.
+	if av.GetRefCount() == 0 {
+		return av
+	}
+	*/
+	var cp *ArrayValue
+	if av.Data == nil {
+		cp = alloc.NewListArray(t, len(av.List))
+		for i, tv := range av.List {
+			cp.List[i] = tv.Copy(alloc)
+		}
+	} else {
+		cp = alloc.NewDataArray(t, len(av.Data))
+		copy(cp.Data, av.Data)
+	}
+	if pid := getDeclaredPkgID(t); pid.IsRealmPkg() {
+		cp.ObjectInfo.SetPkgID(pid)
+	}
+	return cp
+}
+
+// ----------------------------------------
+// SliceValue
+
+type SliceValue struct {
+	Base   Value
+	Offset int
+	Length int
+	Maxcap int
+}
+
+func (sv *SliceValue) GetBase(store Store) *ArrayValue {
+	switch cv := sv.Base.(type) {
+	case nil:
+		return nil
+	case RefValue:
+		array := store.GetObject(cv.ObjectID).(*ArrayValue)
+		sv.Base = array
+		return array
+	case *ArrayValue:
+		return cv
+	default:
+		panic("should not happen")
+	}
+}
+
+func (sv *SliceValue) GetCapacity() int {
+	return sv.Maxcap
+}
+
+func (sv *SliceValue) GetLength() int {
+	return sv.Length
+}
+
+// et is only required for .List byte-slices.
+func (sv *SliceValue) GetElementPointer(store Store, ii int, et Type) PointerValue {
+	// Necessary run-time slice bounds check
+	if ii < 0 {
+		excpt := &Exception{
+			Value: typedRuntimeError(fmt.Sprintf(
+				"runtime error: slice index out of bounds: %d", ii,
+			)),
+		}
+		panic(excpt)
+	} else if sv.Length <= ii {
+		excpt := &Exception{
+			Value: typedRuntimeError(fmt.Sprintf(
+				"runtime error: slice index out of bounds: %d (len=%d)",
+				ii, sv.Length,
+			)),
+		}
+		panic(excpt)
+	}
+	return sv.GetBase(store).GetElementPointer(store, sv.Offset+ii, et)
+}
+
+// ----------------------------------------
+// StructValue
+
+type StructValue struct {
+	ObjectInfo
+	Fields []TypedValue
+}
+
+// TODO handle unexported fields in debug, and also ensure in the preprocessor.
+func (sv *StructValue) GetPointerTo(store Store, path ValuePath) PointerValue {
+	if debug {
+		if path.Depth != 0 {
+			panic(fmt.Sprintf(
+				"expected path.Depth of 0 but got %s %s",
+				path.Name, path,
+			))
+		}
+	}
+	return sv.GetPointerToInt(store, int(path.Index))
+}
+
+func (sv *StructValue) GetPointerToInt(store Store, index int) PointerValue {
+	fv := fillValueTV(store, &sv.Fields[index])
+	return PointerValue{
+		TV:    fv,
+		Base:  sv,
+		Index: index,
+	}
+}
+
+// Like GetPointerTo*, but returns (a pointer of) a reference to field.
+func (sv *StructValue) GetSubrefPointerTo(store Store, st *StructType, path ValuePath) PointerValue {
+	if debug {
+		if path.Depth != 0 {
+			panic(fmt.Sprintf(
+				"expected path.Depth of 0 but got %s %s",
+				path.Name, path,
+			))
+		}
+	}
+	fv := fillValueTV(store, &sv.Fields[path.Index])
+	ft := st.GetStaticTypeOfAt(path)
+	return PointerValue{
+		TV: &TypedValue{ // TODO: optimize
+			T: &PointerType{ // TODO: optimize (cont)
+				Elt: ft,
+			},
+			V: PointerValue{
+				TV:    fv,
+				Base:  sv,
+				Index: int(path.Index),
+			},
+		},
+		Base: nil, // free floating
+	}
+}
+
+// Copy duplicates an existing StructValue. Authority is type-driven, matching
+// the split rule in stampPkgID (PR #5706): if the struct type is /r/-declared,
+// the copy is stamped with that /r/ owner; otherwise the fresh currentRealmID
+// stamp from NewStruct stands, so the copy belongs to the realm doing the
+// copying.
+//
+// Each field is copied individually so value fields stay by-value
+// (e.g. inlined arrays are physically duplicated rather than aliased).
+//
+// Previously this method propagated the source's runtime PkgID whenever it
+// was an /r/ PkgID. See ArrayValue.Copy for the issue (gh #5736) and rationale.
+func (sv *StructValue) Copy(alloc *Allocator, t Type) *StructValue {
+	/* TODO consider second refcount field
+	if sv.GetRefCount() == 0 {
+		return sv
+	}
+	*/
+	fields := alloc.NewStructFields(len(sv.Fields))
+	for i, field := range sv.Fields {
+		fields[i] = field.Copy(alloc)
+	}
+	cp := alloc.NewStruct(t, fields)
+	if pid := getDeclaredPkgID(t); pid.IsRealmPkg() {
+		cp.ObjectInfo.SetPkgID(pid)
+	}
+	return cp
+}
+
+// ----------------------------------------
+// FuncValue
+
+// FuncValue.Type stores the method signature from the
+// declaration, and has exact parameter/result names declared,
+// whereas the TypedValue.T that contains at .V may not. (i.e.
+// TypedValue.T doesn't care about parameter/result names, but
+// the *FuncValue requires this for execution.
+// In leu of FuncValue.Type, we could refer to FuncValue.Source
+// or create a different field with param/result names, but
+// *FuncType is already a suitable structure, and re-using
+// makes construction TypedValue{T:*FuncType{},V:*FuncValue{}}
+// faster.
+type FuncValue struct {
+	ObjectInfo
+	Type       Type         // includes unbound receiver(s)
+	IsMethod   bool         // is an (unbound) method
+	IsClosure  bool         // is a func lit expr closure (not decl)
+	Source     BlockNode    // for block mem allocation
+	Name       Name         // name of function/method
+	Parent     Value        // *Block or RefValue to closure (may be nil for file blocks; lazy)
+	Captures   []TypedValue `json:",omitempty"` // HeapItemValues captured from closure.
+	FileName   string       // file name where declared
+	PkgPath    string       // package path in which func declared
+	NativePkg  string       // for native bindings through NativeResolver
+	NativeName Name         // not redundant with Name; this cannot be changed in userspace
+	Crossing   bool         // true if .body's first statement is crossing().
+
+	body       []Stmt         // function body
+	nativeBody func(*Machine) // alternative to Body
+}
+
+// IsNative reports whether this function is an external native binding
+// (set up via NativeResolver, with NativePkg/NativeName populated and
+// nativeBody filled lazily by Store.GetNative). Returns false for uverse
+// DefineNative helpers (panic, append, cross, etc.) which only have
+// nativeBody set — those still run host code, but the stacktrace
+// formatter and method-redeclaration logic want to distinguish them.
+// For "does this run host code at all" use fv.nativeBody != nil.
+func (fv *FuncValue) IsNative() bool {
+	if fv.NativePkg == "" && fv.NativeName == "" {
+		return false
+	}
+	if fv.NativePkg == "" || fv.NativeName == "" {
+		panic(fmt.Sprintf("function (%q).%s has invalid native pkg/name ((%q).%s)",
+			fv.Source.GetLocation().PkgPath, fv.Name,
+			fv.NativePkg, fv.NativeName))
+	}
+	return true
+}
+
+func (fv *FuncValue) Copy(alloc *Allocator) *FuncValue {
+	alloc.AllocateFunc()
+	cp := &FuncValue{
+		Type:       fv.Type,
+		IsMethod:   fv.IsMethod,
+		Source:     fv.Source,
+		Name:       fv.Name,
+		Parent:     fv.Parent,
+		FileName:   fv.FileName,
+		PkgPath:    fv.PkgPath,
+		NativePkg:  fv.NativePkg,
+		NativeName: fv.NativeName,
+		Crossing:   fv.Crossing,
+		body:       fv.body,
+		nativeBody: fv.nativeBody,
+	}
+	// FuncValue.Copy preserves source PkgID. A closure copy is a
+	// re-binding, not a re-creation in a new realm. The function's
+	// identity belongs to where it was declared, captured by the
+	// source.
+	cp.ObjectInfo.SetPkgID(fv.ObjectInfo.ID.PkgID)
+	return cp
+}
+
+func (fv *FuncValue) GetType(store Store) *FuncType {
+	switch ct := fv.Type.(type) {
+	case nil:
+		return nil
+	case RefType:
+		typ := store.GetType(ct.ID).(*FuncType)
+		fv.Type = typ
+		return typ
+	case *FuncType:
+		return ct
+	default:
+		panic("should not happen")
+	}
+}
+
+func (fv *FuncValue) GetBodyFromSource(store Store) []Stmt {
+	if fv.body == nil {
+		source := fv.GetSource(store)
+		fv.body = source.GetBody()
+		return fv.body
+	}
+	return fv.body
+}
+
+func (fv *FuncValue) UpdateBodyFromSource() {
+	if fv.Source == nil {
+		panic(fmt.Sprintf(
+			"Source is missing for FuncValue %q",
+			fv.Name,
+		))
+	}
+	fv.body = fv.Source.GetBody()
+}
+
+func (fv *FuncValue) GetSource(store Store) BlockNode {
+	if rn, ok := fv.Source.(RefNode); ok {
+		source := store.GetBlockNode(rn.GetLocation())
+		fv.Source = source
+		return source
+	}
+	return fv.Source
+}
+
+func (fv *FuncValue) GetPackage(store Store) *PackageValue {
+	pv := store.GetPackage(fv.PkgPath, false)
+	return pv
+}
+
+func (fv *FuncValue) GetParent(store Store) *Block {
+	if fv.IsClosure {
+		return nil
+	}
+	switch cv := fv.Parent.(type) {
+	case nil:
+		if fv.FileName == "" {
+			return nil
+		}
+		pv := fv.GetPackage(store)
+		// Lazily materialize this function's file block. fillPackage no
+		// longer pre-populates fBlocksMap, so on a package loaded from
+		// the store the entry may be absent here; GetFileBlock loads it
+		// from the FBlocks RefValue on demand and caches it.
+		fb := pv.GetFileBlock(store, fv.FileName)
+		fv.Parent = fb
+		return fb
+	case RefValue:
+		block := store.GetObject(cv.ObjectID).(*Block)
+		fv.Parent = block
+		return block
+	case *Block:
+		return cv
+	default:
+		panic("should not happen")
+	}
+}
+
+func (fv *FuncValue) IsCrossing() bool {
+	return fv.Crossing
+}
+
+// ----------------------------------------
+// BoundMethodValue
+
+type BoundMethodValue struct {
+	ObjectInfo
+
+	// Underlying unbound method function.
+	// The type without the receiver (since bound)
+	// is computed lazily if needed.
+	//
+	// nil for an interface-dispatched bind until the call: the concrete
+	// method is determined by dynamic dispatch on Receiver (the saved
+	// operand) and resolved at call time (see resolveLazyBound).
+	Func *FuncValue
+
+	// This becomes the first arg.
+	// The type is .Func.Type.Params[0].
+	//
+	// For an interface-dispatched bind (Func == nil) this holds the *saved
+	// operand* — the boxed value captured when the method value was formed (a
+	// copy for a value operand, the pointer as-is for a pointer operand), not
+	// the resolved receiver. The call walks it (via Method) to dispatch and
+	// form the receiver, matching Go: deref, value snapshot, nil panic, field
+	// re-read and dynamic re-dispatch all happen at the call.
+	Receiver TypedValue
+
+	// Method is the selector name for an interface-dispatched bind
+	// (Func == nil); the call re-derives the dispatch trail on Receiver's
+	// current value. Empty for a resolved (eager) bind.
+	Method Name
+
+	// MethodPkg is the callerPath of the bind site (the package whose code
+	// formed the method value). Unexported method identity is
+	// package-qualified, so the call-time re-derivation must look up Method
+	// under the same qualification — the dynamic type's own package may see a
+	// different (or shadowing) same-spelled member. Empty for a resolved
+	// (eager) bind.
+	MethodPkg string
+}
+
+// IsLazy reports whether bmv is an unresolved interface-dispatched bind whose
+// concrete method + receiver are resolved at call time from the saved operand.
+func (bmv *BoundMethodValue) IsLazy() bool {
+	return bmv.Func == nil
+}
+
+// resolveInterfaceTrail walks an interface-dispatch trail on the boxed concrete
+// value, returning the resolved bound-method pointer. The walk dereferences as
+// it goes, so running it at call time gives Go's call-time dispatch: nil derefs
+// panic now (per the method's receiver kind — value receivers panic, pointer
+// receivers pass nil through), and a value receiver is a fresh snapshot of the
+// current pointee. A nested interface step yields another lazy bind, which
+// resolveLazyBound unwraps.
+func resolveInterfaceTrail(gm types.GasMeter, alloc *Allocator, store Store, boxed TypedValue, tr []ValuePath, callerPath string) PointerValue {
+	btv := boxed
+	for i, path := range tr {
+		ptr := btv.getPointerToFromTV(gm, alloc, store, path, callerPath)
+		if i == len(tr)-1 {
+			return ptr
+		}
+		btv = ptr.Deref()
+	}
+	panic("should not happen")
+}
+
+// resolveLazyBound resolves an interface-dispatched (lazy) bind to its concrete
+// method + receiver at call time, walking the saved operand's *current* value.
+// So the deref, value snapshot, nil panic, field re-read and dynamic
+// re-dispatch all happen now, matching Go. Each iteration strips one interface
+// indirection (a nested embedded-interface field yields another lazy bind);
+// for a finite (acyclic) operand graph this converges. A cyclic embedded
+// interface (e.g. `s.IG = s`) would re-box the same operand forever, so the
+// loop detects a repeated pointer operand and raises a fatal (gno-unrecoverable)
+// panic instead of hanging — matching Go, which runs the same program as
+// recursion and fatally stack-overflows (uncatchable by recover()).
+//
+// nil derefs are raised by the walk itself (getPointerToFromTV panics with a
+// runtime-error Exception for a value receiver on a nil pointer, and passes nil
+// through for a pointer receiver) — the machine's Run loop converts that to the
+// cooperative panic path, so both immediate and deferred calls behave correctly
+// without a separate nil signal here.
+func resolveLazyBound(m *Machine, bmv *BoundMethodValue) (*FuncValue, TypedValue) {
+	operand := bmv.Receiver
+	name := bmv.Method
+	// The bind-site package qualifies the lookup: unexported method identity
+	// is package-qualified, and the dynamic type's package may hold a
+	// same-spelled member with a different identity (e.g. a shadowing
+	// unexported field), which must not be matched here.
+	callerPath := bmv.MethodPkg
+	if callerPath == "" {
+		callerPath = operand.T.GetPkgPath()
+	}
+	// The method name is invariant across layers, so the operand's identity
+	// fully identifies the loop state: a revisited identity means a cyclic
+	// embed (e.g. `s.IG = s`). Pointer and struct operands are the only shapes
+	// that can recur — another lazy hop needs an embedded interface, and only
+	// structs can embed; anything else terminates this iteration. The graph is
+	// fixed during resolution (no user code runs), and field re-reads yield
+	// stable identities, so any endless walk must revisit a recorded one.
+	var seen map[any]struct{}
+	for {
+		// Charge per hop so the cost scales with embedded-interface depth rather
+		// than being flat per call.
+		m.incrCPU(OpCPULazyBoundResolve)
+		// The saved operand may be a pointer reloaded from the store with an
+		// unfilled TV; fill it so the walk can dereference it. This load of the
+		// live state is what lets field re-read / dynamic re-dispatch observe
+		// updates made after the bind.
+		fillValueTV(m.Store, &operand)
+		var id any
+		switch v := operand.V.(type) {
+		case PointerValue:
+			if v.TV != nil {
+				id = v.TV
+			}
+		case *StructValue:
+			id = v
+		}
+		if id != nil {
+			if _, dup := seen[id]; dup {
+				panic("cyclic embedded interface in method-value dispatch")
+			}
+			if seen == nil {
+				seen = make(map[any]struct{})
+			}
+			seen[id] = struct{}{}
+		}
+		// OpCPULazyBoundResolve above is a flat per-hop base; the walk width
+		// is metered inside findEmbeddedFieldType.
+		tr, _, _, _, status := findEmbeddedFieldType(m.GasMeter, callerPath, operand.T, name)
+		if status != embedLookupFound {
+			// Mirrors the bind-site guard (getPointerToFromTV, VPInterface).
+			// The call-time operand type is the same one that passed that
+			// guard, so this should be unreachable; guard anyway rather than
+			// fall into resolveInterfaceTrail's "should not happen".
+			panic(fmt.Sprintf("method %s not found in type %s",
+				name, operand.T.String()))
+		}
+		next := resolveInterfaceTrail(m.GasMeter, m.Alloc, m.Store, operand, tr, callerPath).Deref().V.(*BoundMethodValue)
+		if !next.IsLazy() {
+			return next.Func, next.Receiver
+		}
+		operand, name, callerPath = next.Receiver, next.Method, next.MethodPkg
+	}
+}
+
+func (bmv *BoundMethodValue) IsCrossing() bool {
+	// A lazy interface bind has no concrete Func until call time; crossing-ness
+	// is a property of the resolved method, determined then. An interface
+	// method value is never itself a crossing entry point (crossing functions
+	// are not part of interface method sets in production code), so report
+	// false until resolved.
+	if bmv.IsLazy() {
+		return false
+	}
+	return bmv.Func.IsCrossing()
+}
+
+// ----------------------------------------
+// MapValue
+
+type MapValue struct {
+	ObjectInfo
+	List *MapList
+
+	vmap map[MapKey]*MapListItem // nil if uninitialized
+}
+
+type MapKey string
+
+type MapList struct {
+	Head *MapListItem
+	Tail *MapListItem
+	Size int
+}
+
+type MapListImage struct {
+	List []*MapListItem
+}
+
+func (ml MapList) MarshalAmino() (MapListImage, error) {
+	mlimg := make([]*MapListItem, 0, ml.Size)
+	for head := ml.Head; head != nil; head = head.Next {
+		mlimg = append(mlimg, head)
+	}
+	return MapListImage{List: mlimg}, nil
+}
+
+func (ml *MapList) UnmarshalAmino(mlimg MapListImage) error {
+	for i, item := range mlimg.List {
+		if i == 0 {
+			item.Prev = nil
+			ml.Head = item
+			ml.Tail = item
+			ml.Size = 1
+		} else {
+			item.Prev = ml.Tail
+			ml.Tail.Next = item
+			ml.Tail = item
+			ml.Size++
+		}
+	}
+	return nil
+}
+
+// NOTE: Value is undefined until assigned.
+func (ml *MapList) Append(alloc *Allocator, key TypedValue) *MapListItem {
+	alloc.AllocateMapItem()
+	item := &MapListItem{
+		Prev: ml.Tail,
+		Next: nil,
+		Key:  key,
+		// Value: undefined,
+	}
+	if ml.Head == nil {
+		ml.Head = item
+		ml.Tail = item
+		ml.Size = 1
+	} else {
+		ml.Tail.Next = item
+		ml.Tail = item
+		ml.Size++
+	}
+	return item
+}
+
+func (ml *MapList) Remove(mli *MapListItem) {
+	if ml.Size == 0 {
+		return
+	}
+	prev, next := mli.Prev, mli.Next
+	if prev == nil {
+		ml.Head = next
+	} else {
+		prev.Next = next
+	}
+	if next == nil {
+		ml.Tail = prev
+	} else {
+		next.Prev = prev
+	}
+	ml.Size--
+}
+
+type MapListItem struct {
+	Prev  *MapListItem `json:"-"`
+	Next  *MapListItem `json:"-"`
+	Key   TypedValue
+	Value TypedValue
+}
+
+// MakeMap initializes mv with no capacity hint: the make() size argument
+// is intentionally not honored (see the make() map case in uverse.go).
+func (mv *MapValue) MakeMap() {
+	mv.List = &MapList{}
+	mv.vmap = make(map[MapKey]*MapListItem)
+}
+
+func (mv *MapValue) GetLength() int {
+	return mv.List.Size // panics if uninitialized
+}
+
+// GetPointerForKey is only used for assignment, so the key
+// is not returned as part of the pointer, and TV is not filled.
+func (mv *MapValue) GetPointerForKey(alloc *Allocator, gm types.GasMeter, store Store, key TypedValue) PointerValue {
+	kmk, isNaN := key.ComputeMapKey(gm, store, false)
+	return mv.getPointerForComputedKey(alloc, kmk, isNaN, key)
+}
+
+// getPointerForComputedKey is GetPointerForKey with the map key already
+// computed (and charged) by the caller — GetPointerAtIndex computes it for
+// its oldObject lookup, and recomputing from a value-copy would return the
+// same MapKey and charge the meter twice per assignment.
+func (mv *MapValue) getPointerForComputedKey(alloc *Allocator, kmk MapKey, isNaN bool, key TypedValue) PointerValue {
+	// If NaN, instead of using the map key, just append to List.
+	if !isNaN {
+		if mli, ok := mv.vmap[kmk]; ok {
+			// When assigning to a map item, the key is always equal to that of the
+			// last assignment; this is mostly noticeable in the case of -0 / 0:
+			// https://go.dev/play/p/iNPDR4FQlRv
+			mli.Key = key
+			return PointerValue{
+				TV:    &mli.Value,
+				Base:  mv,
+				Index: PointerIndexMap,
+			}
+		}
+	}
+	mli := mv.List.Append(alloc, key)
+
+	mv.vmap[kmk] = mli
+	return PointerValue{
+		TV:    &mli.Value,
+		Base:  mv,
+		Index: PointerIndexMap,
+	}
+}
+
+// Like GetPointerForKey, but does not create a slot if key
+// doesn't exist.
+func (mv *MapValue) GetValueForKey(gm types.GasMeter, store Store, key *TypedValue) (val TypedValue, ok bool) {
+	// If key is NaN, return default
+	kmk, isNaN := key.ComputeMapKey(gm, store, false)
+	if isNaN {
+		return
+	}
+	if mli, exists := mv.vmap[kmk]; exists {
+		fillValueTV(store, &mli.Value)
+		val, ok = mli.Value, true
+	}
+	return
+}
+
+// DeleteForKey removes the entry for key and returns the STORED key TypedValue
+// that was removed (nil if the key was absent or NaN). Callers must dirty-mark /
+// DecRef this stored key's object, not the (possibly transient) argument key —
+// otherwise a non-primitive stored key object is orphaned in the store.
+func (mv *MapValue) DeleteForKey(gm types.GasMeter, store Store, key *TypedValue) (deletedKey *TypedValue) {
+	// if key is NaN, do nothing.
+	kmk, isNaN := key.ComputeMapKey(gm, store, false)
+	if isNaN {
+		return nil
+	}
+	if mli, ok := mv.vmap[kmk]; ok {
+		mv.List.Remove(mli)
+		delete(mv.vmap, kmk)
+		return &mli.Key
+	}
+	return nil
+}
+
+// ----------------------------------------
+// TypeValue
+
+// The type itself as a value.
+type TypeValue struct {
+	Type Type
+}
+
+// ----------------------------------------
+// PackageValue
+
+type PackageValue struct {
+	ObjectInfo // is a separate object from .Block.
+	Block      Value
+	PkgName    Name
+	PkgPath    string
+	// PkgID is the denormalized cache of PkgIDFromPkgPath(PkgPath).
+	// Set at construction (alloc.go:NewPackageValue, preprocess.go
+	// package-init paths, etc.) and re-derived on load in
+	// fillPackage. NOT serialized — wire format is unchanged.
+	PkgID   PkgID `json:"-"`
+	FNames  []string
+	FBlocks []Value
+	Realm   *Realm `json:"-"` // if IsRealmPath(PkgPath), otherwise nil.
+	Private bool
+	// NOTE: Realm is persisted separately.
+
+	fBlocksMap map[string]*Block
+}
+
+// See PackageNode.NewPackage() for PackageValue constructor.
+// Do not uncomment; always use PackageNode.NewPackage().
+// func NewPackageValue() {}
+
+// IsRealm returns true if pv represents a realm.
+func (pv *PackageValue) IsRealm() bool {
+	return IsRealmPath(pv.PkgPath)
+}
+
+// XXX, pass in allocator
+func (pv *PackageValue) getFBlocksMap() map[string]*Block {
+	if pv.fBlocksMap == nil {
+		pv.fBlocksMap = make(map[string]*Block, len(pv.FNames))
+	}
+	return pv.fBlocksMap
+}
+
+// called after loading *PackageValue.
+func (pv *PackageValue) deriveFBlocksMap(store Store) {
+	if pv.fBlocksMap == nil {
+		pv.fBlocksMap = make(map[string]*Block, len(pv.FNames))
+	}
+	for i := range pv.FNames {
+		fname := pv.FNames[i]
+		fblock := pv.GetFileBlock(store, fname)
+		pv.fBlocksMap[fname] = fblock // idempotent.
+	}
+}
+
+// Retrieves the block from store if necessary.
+// Block values are filled lazily via GetPointerToInt/fillValueTV.
+func (pv *PackageValue) GetBlock(store Store) *Block {
+	bv := pv.Block
+	switch bv := bv.(type) {
+	case RefValue:
+		bb := store.GetObject(bv.ObjectID).(*Block)
+		pv.Block = bb
+		return bb
+	case *Block:
+		return bv
+	default:
+		panic("should not happen")
+	}
+}
+
+func (pv *PackageValue) GetValueAt(store Store, path ValuePath) TypedValue {
+	return *pv.
+		GetBlock(store).
+		GetPointerTo(store, path).
+		TV
+}
+
+func (pv *PackageValue) AddFileBlock(fname string, fb *Block) {
+	for _, fn := range pv.FNames {
+		if fname == fn {
+			panic(fmt.Sprintf(
+				"duplicate file block for file %s",
+				fname,
+			))
+		}
+	}
+	pv.FNames = append(pv.FNames, fname)
+	pv.FBlocks = append(pv.FBlocks, fb)
+	pv.getFBlocksMap()[fname] = fb
+	fb.SetOwner(pv)
+}
+
+func (pv *PackageValue) GetFileBlock(store Store, fname string) *Block {
+	if fb, ex := pv.getFBlocksMap()[fname]; ex {
+		return fb
+	}
+	for i, fn := range pv.FNames {
+		if fn == fname {
+			fbv := pv.FBlocks[i]
+			switch fbv := fbv.(type) {
+			case RefValue:
+				fb := store.GetObject(fbv.ObjectID).(*Block)
+				pv.getFBlocksMap()[fname] = fb
+				return fb
+			case *Block:
+				pv.getFBlocksMap()[fname] = fbv
+				return fbv
+			default:
+				panic("should not happen")
+			}
+		}
+	}
+	panic(fmt.Sprintf(
+		"file %v not found in package %v",
+		fname,
+		pv,
+	))
+}
+
+func (pv *PackageValue) GetRealm() *Realm {
+	return pv.Realm
+}
+
+func (pv *PackageValue) SetRealm(rlm *Realm) {
+	pv.Realm = rlm
+}
+
+func (pv *PackageValue) SetPrivate(private bool) {
+	pv.Private = private
+}
+
+// Convenience.
+func (pv *PackageValue) GetPackageNode(store Store) *PackageNode {
+	return pv.GetBlock(store).GetSource(store).(*PackageNode)
+}
+
+// Convenience
+func (pv *PackageValue) GetPkgAddr() crypto.Address {
+	return DerivePkgCryptoAddr(pv.PkgPath)
+}
+
+func (pv *PackageValue) GetPkgStorageDepositAddr() crypto.Address {
+	return DeriveStorageDepositCryptoAddr(pv.PkgPath)
+}
+
+// ----------------------------------------
+// TypedValue (is not a value, but a tuple)
+
+type TypedValue struct {
+	T Type    `json:",omitempty"`
+	V Value   `json:",omitempty"`
+	N [8]byte `json:",omitempty"`
+}
+
+func (tv *TypedValue) IsImmutable() bool {
+	return tv.T == nil || tv.T.IsImmutable()
+}
+
+func (tv *TypedValue) IsDefined() bool {
+	return !tv.IsUndefined()
+}
+
+func (tv *TypedValue) IsUndefined() bool {
+	if debug {
+		if tv.T == nil {
+			if tv.V != nil {
+				panic("should not happen")
+			}
+			if tv.N != [8]byte{} {
+				panic("should not happen")
+			}
+		}
+	}
+	return tv.T == nil
+}
+
+func (tv *TypedValue) IsTypedNil() bool {
+	if tv.V != nil {
+		return false
+	}
+	if tv.T != nil {
+		switch tv.T.Kind() {
+		case SliceKind, FuncKind, MapKind, InterfaceKind, PointerKind:
+			return true
+		}
+	}
+	return false
+}
+
+// (this is used mostly by the preprocessor)
+func (tv *TypedValue) IsNilInterface() bool {
+	if tv.T != nil && tv.T.Kind() == InterfaceKind {
+		if tv.V == nil {
+			return true
+		}
+		if debug {
+			if tv.N != [8]byte{} {
+				panic("corrupted TypeValue (nil interface)")
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func (tv *TypedValue) HasKind(k Kind) bool {
+	if tv.T == nil {
+		return false
+	}
+	return tv.T.Kind() == k
+}
+
+// for debugging, returns true if V or N is not zero.  just because V and N are
+// zero doesn't mean it didn't get a value set.
+func (tv *TypedValue) DebugHasValue() bool {
+	if !debug {
+		panic("should not happen")
+	}
+	if tv.V != nil {
+		return true
+	}
+	if tv.N != [8]byte{} {
+		return true
+	}
+	return false
+}
+
+func (tv *TypedValue) ClearNum() {
+	*(*uint64)(unsafe.Pointer(&tv.N)) = uint64(0)
+}
+
+func (tv TypedValue) Copy(alloc *Allocator) (cp TypedValue) {
+	switch cv := tv.V.(type) {
+	case BigintValue:
+		cp.T = tv.T
+		cp.V = cv.Copy(alloc)
+	case *ArrayValue:
+		cp.T = tv.T
+		cp.V = cv.Copy(alloc, tv.T)
+	case *StructValue:
+		cp.T = tv.T
+		cp.V = cv.Copy(alloc, tv.T)
+	default:
+		cp = tv
+	}
+	return
+}
+
+// unrefCopy makes a copy of the underlying value in the case of reference values.
+// It copies other values as expected using the normal Copy method.
+func (tv TypedValue) unrefCopy(alloc *Allocator, store Store) (cp TypedValue) {
+	switch tv.V.(type) {
+	case RefValue:
+		cp = tv // start from the header (T, N); V is replaced below
+		refObject := tv.GetFirstObject(store)
+		switch refObjectValue := refObject.(type) {
+		case *ArrayValue:
+			cp.V = refObjectValue.Copy(alloc, tv.T)
+		case *StructValue:
+			cp.V = refObjectValue.Copy(alloc, tv.T)
+		}
+	default:
+		cp = tv.Copy(alloc)
+	}
+
+	return
+}
+
+// Returns encoded bytes for primitive values.
+// These are used for computing map keys.
+// If NaN float32|float64 returns bz unchanged and isNaN=true.
+func (tv *TypedValue) MapKeyBytes(bz []byte) (bz2 []byte, isNaN bool) {
+	switch bt := baseOf(tv.T); bt {
+	case BoolType:
+		if tv.GetBool() {
+			return append(bz, 0x01), false
+		}
+		return append(bz, 0x00), false
+	case StringType:
+		return append(bz, tv.GetString()...), false
+	case Int8Type:
+		return append(bz, uint8(tv.GetInt8())), false
+	case Int16Type:
+		return binary.LittleEndian.AppendUint16(bz, uint16(tv.GetInt16())), false
+	case Int32Type:
+		return binary.LittleEndian.AppendUint32(bz, uint32(tv.GetInt32())), false
+	case IntType, Int64Type:
+		return binary.LittleEndian.AppendUint64(bz, uint64(tv.GetInt())), false
+	case Uint8Type:
+		return append(bz, tv.GetUint8()), false
+	case Uint16Type:
+		return binary.LittleEndian.AppendUint16(bz, tv.GetUint16()), false
+	case Uint32Type:
+		return binary.LittleEndian.AppendUint32(bz, tv.GetUint32()), false
+	case UintType, Uint64Type:
+		return binary.LittleEndian.AppendUint64(bz, tv.GetUint()), false
+	case Float32Type:
+		u32 := tv.GetFloat32()
+		if u32 == 0 || u32 == (1<<31) { // 0 or -0 normalized to 0
+			return binary.LittleEndian.AppendUint32(bz, 0), false
+		}
+		if _, _, _, _, isNaN = softfloat.Funpack32(u32); isNaN {
+			return bz, true
+		}
+		return binary.LittleEndian.AppendUint32(bz, u32), false
+	case Float64Type:
+		u64 := tv.GetFloat64()
+		if u64 == 0 || u64 == (1<<63) { // 0 or -0 normalized to 0
+			return binary.LittleEndian.AppendUint64(bz, 0), false
+		}
+		if _, _, _, _, isNaN = softfloat.Funpack64(u64); isNaN {
+			return bz, true
+		}
+		return binary.LittleEndian.AppendUint64(bz, u64), false
+	default:
+		panic(fmt.Sprintf(
+			"unexpected primitive value type: %s",
+			bt.String(),
+		))
+	}
+}
+
+// Setting IntValue to Value is slow, and creates
+// a heap allocation.  So N exists as a hack to keep
+// values stored without interfaces..
+
+func (tv *TypedValue) SetBool(b bool) {
+	if debug {
+		if tv.T.Kind() != BoolKind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetBool() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*bool)(unsafe.Pointer(&tv.N)) = b
+}
+
+func (tv *TypedValue) GetBool() bool {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != BoolKind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetBool() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*bool)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetString(s StringValue) {
+	if debug {
+		if tv.T.Kind() != StringKind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetString() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	tv.V = s
+}
+
+func (tv *TypedValue) GetString() string {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != StringKind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetString() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	if tv.V == nil {
+		return ""
+	}
+	return string(tv.V.(StringValue))
+}
+
+func (tv *TypedValue) SetInt(n int64) {
+	if debug {
+		if tv.T.Kind() != IntKind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetInt() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*int64)(unsafe.Pointer(&tv.N)) = n
+}
+
+func (tv *TypedValue) ConvertGetInt() int64 {
+	var store Store = nil // not used
+	// IntType-only conversion: no allocation occurs, so pass a nil
+	// (no-op) allocator.
+	ConvertTo(nil, store, tv, IntType, false)
+	return tv.GetInt()
+}
+
+func (tv *TypedValue) GetInt() int64 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != IntKind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetInt() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*int64)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetInt8(n int8) {
+	if debug {
+		if tv.T.Kind() != Int8Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetInt8() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*int8)(unsafe.Pointer(&tv.N)) = n
+}
+
+func (tv *TypedValue) GetInt8() int8 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != Int8Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetInt8() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*int8)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetInt16(n int16) {
+	if debug {
+		if tv.T.Kind() != Int16Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetInt16() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*int16)(unsafe.Pointer(&tv.N)) = n
+}
+
+func (tv *TypedValue) GetInt16() int16 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != Int16Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetInt16() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*int16)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetInt32(n int32) {
+	if debug {
+		if tv.T.Kind() != Int32Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetInt32() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*int32)(unsafe.Pointer(&tv.N)) = n
+}
+
+func (tv *TypedValue) GetInt32() int32 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != Int32Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetInt32() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*int32)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetInt64(n int64) {
+	if debug {
+		if tv.T.Kind() != Int64Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetInt64() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*int64)(unsafe.Pointer(&tv.N)) = n
+}
+
+func (tv *TypedValue) GetInt64() int64 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != Int64Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetInt64() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*int64)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetUint(n uint64) {
+	if debug {
+		if tv.T.Kind() != UintKind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetUint() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*uint64)(unsafe.Pointer(&tv.N)) = n
+}
+
+func (tv *TypedValue) GetUint() uint64 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != UintKind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetUint() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*uint64)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetUint8(n uint8) {
+	if debug {
+		if tv.T.Kind() != Uint8Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetUint8() on type %s",
+				tv.T.String(),
+			))
+		}
+		if tv.T == DataByteType {
+			panic("DataByteType should call SetDataByte")
+		}
+	}
+	*(*uint8)(unsafe.Pointer(&tv.N)) = n
+}
+
+func (tv *TypedValue) GetUint8() uint8 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != Uint8Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetUint8() on type %s",
+				tv.T.String(),
+			))
+		}
+		if tv.T == DataByteType {
+			panic("DataByteType should call GetDataByte or GetUint8OrDataByte")
+		}
+	}
+	return *(*uint8)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetDataByte(n uint8) {
+	if debug {
+		if tv.T != DataByteType {
+			panic(fmt.Sprintf(
+				"TypedValue.SetDataByte() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	dbv := tv.V.(DataByteValue)
+	dbv.SetByte(n)
+}
+
+func (tv *TypedValue) GetDataByte() uint8 {
+	if debug {
+		if tv.T != nil && tv.T != DataByteType {
+			panic(fmt.Sprintf(
+				"TypedValue.GetDataByte() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	dbv := tv.V.(DataByteValue)
+	return dbv.GetByte()
+}
+
+func (tv *TypedValue) SetUint16(n uint16) {
+	if debug {
+		if tv.T.Kind() != Uint16Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetUint16() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*uint16)(unsafe.Pointer(&tv.N)) = n
+}
+
+func (tv *TypedValue) GetUint16() uint16 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != Uint16Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetUint16() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*uint16)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetUint32(n uint32) {
+	if debug {
+		if tv.T.Kind() != Uint32Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetUint32() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*uint32)(unsafe.Pointer(&tv.N)) = n
+}
+
+func (tv *TypedValue) GetUint32() uint32 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != Uint32Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetUint32() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*uint32)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetUint64(n uint64) {
+	if debug {
+		if tv.T.Kind() != Uint64Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetUint64() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*uint64)(unsafe.Pointer(&tv.N)) = n
+}
+
+func (tv *TypedValue) GetUint64() uint64 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != Uint64Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetUint64() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*uint64)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetFloat32(u32 uint32) {
+	if debug {
+		if tv.T.Kind() != Float32Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetFloat32() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*uint32)(unsafe.Pointer(&tv.N)) = u32
+}
+
+func (tv *TypedValue) GetFloat32() uint32 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != Float32Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetFloat32() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*uint32)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) SetFloat64(u64 uint64) {
+	if debug {
+		if tv.T.Kind() != Float64Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.SetFloat64() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	*(*uint64)(unsafe.Pointer(&tv.N)) = u64
+}
+
+func (tv *TypedValue) GetFloat64() uint64 {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != Float64Kind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetFloat64() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return *(*uint64)(unsafe.Pointer(&tv.N))
+}
+
+func (tv *TypedValue) GetBigInt() *big.Int {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != BigintKind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetBigInt() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return tv.V.(BigintValue).V
+}
+
+func (tv *TypedValue) GetBigDec() BigdecValue {
+	if debug {
+		if tv.T != nil && tv.T.Kind() != BigdecKind {
+			panic(fmt.Sprintf(
+				"TypedValue.GetBigDec() on type %s",
+				tv.T.String(),
+			))
+		}
+	}
+	return tv.V.(BigdecValue)
+}
+
+// Sign returns the sign of the given numeric tv.
+func (tv *TypedValue) Sign() int {
+	if tv.T == nil {
+		panic("type should not be nil")
+	}
+
+	switch tv.T.Kind() {
+	case IntKind:
+		return signOfInteger(tv.GetInt())
+	case Int8Kind:
+		return signOfInteger(int64(tv.GetInt8()))
+	case Int16Kind:
+		return signOfInteger(int64(tv.GetInt16()))
+	case Int32Kind:
+		return signOfInteger(int64(tv.GetInt32()))
+	case Int64Kind:
+		return signOfInteger(tv.GetInt64())
+	case UintKind:
+		return signOfInteger(tv.GetUint())
+	case Uint8Kind:
+		return signOfInteger(uint64(tv.GetUint8()))
+	case Uint16Kind:
+		return signOfInteger(uint64(tv.GetUint16()))
+	case Uint32Kind:
+		return signOfInteger(uint64(tv.GetUint32()))
+	case Uint64Kind:
+		return signOfInteger(tv.GetUint64())
+	case Float32Kind:
+		return signOfFloat32Bits(tv.GetFloat32())
+	case Float64Kind:
+		return signOfFloat64Bits(tv.GetFloat64())
+	case BigintKind:
+		v := tv.GetBigInt()
+		return v.Sign()
+	case BigdecKind:
+		v := tv.GetBigDec()
+		return v.Sign()
+	default:
+		panic("type should be numeric")
+	}
+}
+
+// ComputeMapKey returns the value of tv, encoded as a string for usage inside
+// of a map.
+//
+// isNaN returns whether tv, or any of the values contained within (like in an
+// array or struct) are NaN's; this would make the same tv != to itself, and
+// so shouldn't be included within a vmap.
+//
+// gm is the gas meter to charge for the key computation: VM-runtime callers
+// pass m.GasMeter, the realm-restore path passes the store's tx-scoped meter
+// (see loadObjectSafe). nil means unmetered: tests and tools, plus
+// GetPointerAtIndex's nil-Machine path, which only ever reaches the
+// slice/string branches (see GetPointerAtIndexInt) and so computes no
+// map key.
+func (tv *TypedValue) ComputeMapKey(gm types.GasMeter, store Store, omitType bool) (key MapKey, isNaN bool) {
+	if gm != nil {
+		gm.ConsumeGas(OpCPUComputeMapKey, GasComputeMapKeyDesc)
+	}
+	// Special case when nil: has no separator.
+	if tv.T == nil {
+		if debug {
+			if omitType {
+				panic("should not happen")
+			}
+		}
+		return nilStr, false
+	}
+	// Static uncomparable keys are rejected at preprocess; an uncomparable
+	// tv.T here came via interface boxing. isComparable recurses, so the
+	// panic names the outer dynamic type, matching Go.
+	if !isComparable(tv.T) {
+		panic(&Exception{Value: typedRuntimeError(
+			"runtime error: hash of unhashable type " + tv.T.String(),
+		)})
+	}
+	// General case.
+	bz := make([]byte, 0, 64)
+	// Charge per-byte for all bytes appended to bz in this call (TypeID
+	// prefix, av.Data, string content, brackets/separators, uvarint
+	// length headers, children's mk re-appended). This catches every
+	// O(N) work path uniformly, including early isNaN returns.
+	if gm != nil {
+		defer func() {
+			gm.ConsumeGas(int64(len(bz))*OpCPUSlopeComputeMapKeyByte/10, GasComputeMapKeyDesc)
+		}()
+	}
+	if !omitType {
+		// TypeID is human readable and balanced, so appending ":" works.
+		// This keeps ComputeMapKey somewhat human readable esp w/
+		// colors.ColoredBytes().
+		bz = append(bz, tv.T.TypeID().Bytes()...)
+		bz = append(bz, ':') // type/value separator
+	}
+	switch bt := baseOf(tv.T).(type) {
+	case PrimitiveType:
+		bz, isNaN = tv.MapKeyBytes(bz)
+		if isNaN {
+			return "", true
+		}
+	case *PointerType:
+		if tv.V == nil {
+			var ptrBytes [sizeOfUintPtr]byte
+			bz = append(bz, ptrBytes[:]...)
+		} else {
+			pv := tv.V.(PointerValue)
+			if pv.TV != nil && pv.TV.T == DataByteType {
+				// TV is freshly allocated per access (see GetElementPointer);
+				// so we cannot simply convert to uintptr.
+				// We instead use the pointer to Base + concat with Index.
+				// This causes a longer pointer value, but does not cause issues
+				// because when we encode pointers in arrays or structs they are
+				// length-prefixed.
+				dbv := pv.TV.V.(DataByteValue)
+				base := uintptr(unsafe.Pointer(dbv.Base))
+				baseBytes := uintptrToBytes(&base)
+				bz = append(bz, baseBytes[:]...)
+				bz = binary.AppendUvarint(bz, uint64(dbv.Index))
+			} else {
+				ptr := uintptr(unsafe.Pointer(pv.TV))
+				ptrBytes := uintptrToBytes(&ptr)
+				bz = append(bz, ptrBytes[:]...)
+			}
+		}
+	case *ArrayType:
+		av := tv.V.(*ArrayValue)
+		al := av.GetLength()
+		bz = append(bz, '[')
+		if av.Data == nil {
+			if tv.T.Elem().Kind() == Uint8Kind {
+				panic("should not happen; unexpected list array for array with uint8 element kind")
+			}
+			omitTypes := bt.Elem().Kind() != InterfaceKind
+			for i := range al {
+				ev := fillValueTV(store, &av.List[i])
+				mk, isNaN := ev.ComputeMapKey(gm, store, omitTypes)
+				if isNaN {
+					return "", true
+				}
+				bz = binary.AppendUvarint(bz, uint64(len(mk)))
+				bz = append(bz, mk...)
+				if i != al-1 {
+					bz = append(bz, ',')
+				}
+			}
+		} else {
+			bz = append(bz, av.Data...)
+		}
+		bz = append(bz, ']')
+	case *StructType:
+		sv := tv.V.(*StructValue)
+		sl := len(sv.Fields)
+		bz = append(bz, '{')
+		var appendComma bool
+		for i := range sl {
+			if bt.Fields[i].Name == blankIdentifier {
+				continue
+			}
+			fv := fillValueTV(store, &sv.Fields[i])
+			omitTypes := bt.Fields[i].Type.Kind() != InterfaceKind
+			mk, isNaN := fv.ComputeMapKey(gm, store, omitTypes)
+			if isNaN {
+				return "", true
+			}
+			if appendComma {
+				bz = append(bz, ',')
+			} else {
+				appendComma = true
+			}
+			bz = binary.AppendUvarint(bz, uint64(len(mk)))
+			bz = append(bz, mk...)
+		}
+		bz = append(bz, '}')
+	default:
+		// Defensive fallback: the isComparable gate above already stops
+		// every uncomparable type (slices, maps, funcs, chans, ...) before
+		// the switch, so this is unreachable in practice.
+		panic(&Exception{Value: typedRuntimeError(
+			"runtime error: hash of unhashable type " + tv.T.String(),
+		)})
+	}
+	return MapKey(bz), false
+}
+
+// ----------------------------------------
+// Value utility/manipulation functions.
+
+// Unlike PointerValue.Assign2, does not consider DataByte or
+// addressable NativeValue fields/elems.
+// cu: convert untyped after assignment. pass false
+// for const definitions, but true for all else.
+func (tv *TypedValue) Assign(alloc *Allocator, tv2 TypedValue, cu bool) {
+	if debug {
+		if tv.T == DataByteType {
+			// assignment to data byte types should only
+			// happen via *PointerValue.Assign2().
+			panic("should not happen")
+		}
+		if tv2.T == DataByteType {
+			// tv2 will never be a DataByte, as it is
+			// retrieved as value.
+			panic("should not happen")
+		}
+	}
+	*tv = tv2.Copy(alloc)
+	if cu && isUntyped(tv.T) {
+		ConvertUntypedTo(tv, defaultTypeOf(tv.T))
+	}
+}
+
+// Define to a block slot that takes into account heap escapes.
+// (only blocks can contain heap items).
+// This should only be used when both the base parent and the value are unreal
+// new values, or call rlm.DidUpdate manually.
+func (tv *TypedValue) AssignToBlock(other TypedValue) {
+	if _, ok := tv.T.(heapItemType); ok {
+		tv.V.(*HeapItemValue).Value = other
+	} else {
+		*tv = other
+	}
+}
+
+// NOTE: Allocation for PointerValue is not immediate,
+// as usually PointerValues are temporary for assignment
+// or binary operations. When a pointer is to be
+// allocated, *Allocator.AllocatePointer() is called separately,
+// as in OpRef.
+// callerPath is the package of the code executing the selector; VPInterface
+// resolution needs it to pick the right same-spelled unexported method
+// (identity is package-qualified). Empty falls back to the dynamic type's
+// package, which is only correct when no such collision exists (debugger).
+// gm meters the embedding walk of the VPInterface branch (lazy interface
+// method value); nil only for callers that never reach it.
+func (tv *TypedValue) getPointerToFromTV(gm types.GasMeter, alloc *Allocator, store Store, path ValuePath, callerPath string) PointerValue {
+	if debug {
+		if tv.IsUndefined() {
+			panic("getPointerToFromTV() on undefined value")
+		}
+	}
+	// NOTE: path will be mutated.
+	// NOTE: this code segment similar to that in op_types.go
+	var dtv *TypedValue
+	isPtr := false
+	switch path.Type {
+	case VPField:
+		switch path.Depth {
+		case 0:
+			dtv = tv
+		case 1:
+			dtv = tv
+			path.SetDepth(0)
+		default:
+			panic("should not happen")
+		}
+	case VPSubrefField:
+		// A subref field access through a nil pointer is a nil-pointer deref
+		// (e.g. reaching a promoted pointer-receiver method's receiver via an
+		// embedded field of a nil *T). Matches Go; previously crashed the VM.
+		if tv.V == nil {
+			panic(&Exception{Value: typedRuntimeError("runtime error: nil pointer dereference")})
+		}
+		switch path.Depth {
+		case 0:
+			dtv = tv.V.(PointerValue).TV
+			isPtr = true
+		case 1:
+			dtv = tv.V.(PointerValue).TV
+			isPtr = true
+			path.SetDepth(0)
+		case 2:
+			dtv = tv.V.(PointerValue).TV
+			isPtr = true
+			path.SetDepth(0)
+		case 3:
+			dtv = tv.V.(PointerValue).TV
+			isPtr = true
+			path.SetDepth(0)
+		default:
+			panic("should not happen")
+		}
+	case VPDerefField:
+		switch path.Depth {
+		case 0:
+			dtv = tv.V.(PointerValue).TV
+			isPtr = true
+			path.Type = VPField
+		case 1:
+			dtv = tv.V.(PointerValue).TV
+			isPtr = true
+			path.Type = VPField
+			path.SetDepth(0)
+		case 2:
+			if tv.V == nil {
+				panic(&Exception{Value: typedRuntimeError("runtime error: nil pointer dereference")})
+			}
+			dtv = tv.V.(PointerValue).TV
+			isPtr = true
+			path.Type = VPField
+			path.SetDepth(0)
+		case 3:
+			dtv = tv.V.(PointerValue).TV
+			isPtr = true
+			path.Type = VPField
+			path.SetDepth(0)
+		default:
+			panic("should not happen")
+		}
+	case VPDerefValMethod:
+		// Concrete `pt.M`: Go snapshots the value receiver when the method
+		// value is formed, so a nil pointer derefs (panics) eagerly here.
+		// (Interface dispatch never reaches this at bind — VPInterface binds
+		// lazily and this runs at call time via resolveInterfaceTrail, where
+		// eager-deref is exactly Go's call-time semantics.)
+		if tv.V == nil {
+			msg := "runtime error: nil pointer dereference"
+			if pt, ok := tv.T.(*PointerType); ok {
+				if dt, ok := pt.Elt.(*DeclaredType); ok {
+					msg = fmt.Sprintf(
+						"value method %s.%s.%s called using nil *%s pointer",
+						dt.PkgPath, dt.Name, path.Name, dt.Name,
+					)
+				}
+			}
+			panic(&Exception{Value: typedRuntimeError(msg)})
+		}
+		dtv2 := tv.V.(PointerValue).TV
+		dtv = &TypedValue{ // In case method is called on converted type, like ((*othertype)x).Method().
+			T: tv.T.Elem(),
+			V: dtv2.V,
+			N: dtv2.N,
+		}
+		isPtr = true
+		path.Type = VPValMethod
+	case VPDerefPtrMethod:
+		// dtv = tv.V.(PointerValue).TV
+		// dtv not used due to possible nil receivers.
+		isPtr = true
+		path.Type = VPPtrMethod // XXX pseudo
+	case VPDerefInterface:
+		dtv = tv.V.(PointerValue).TV
+		isPtr = true
+		path.Type = VPInterface
+	default:
+		dtv = tv
+	}
+	if debug {
+		path.Validate()
+	}
+
+	// fill dtv.V if needed.
+	if dtv == nil {
+		// skip, e.g. for nil pointer method receiver.
+	} else {
+		fillValueTV(store, dtv)
+	}
+
+	switch path.Type {
+	case VPBlock:
+		switch dtv.T.(type) {
+		case *PackageType:
+			pv := dtv.V.(*PackageValue)
+			return pv.GetBlock(store).GetPointerTo(store, path)
+		default:
+			panic("should not happen")
+		}
+	case VPField:
+		switch baseOf(dtv.T).(type) {
+		case *StructType:
+			return dtv.V.(*StructValue).GetPointerTo(store, path)
+		case *TypeType:
+			switch t := dtv.V.(TypeValue).Type.(type) {
+			case *PointerType:
+				dt := t.Elt.(*DeclaredType)
+				tv := dt.GetValueAt(alloc, store, path)
+				return PointerValue{
+					TV:   &tv, // heap alloc
+					Base: nil, // TODO: make TypeValue an object.
+				}
+			case *DeclaredType:
+				tv := t.GetValueAt(alloc, store, path)
+				return PointerValue{
+					TV:   &tv, // heap alloc
+					Base: nil, // TODO: make TypeValue an object.
+				}
+			default:
+				panic("unexpected selector base typeval.")
+			}
+		default:
+			panic(fmt.Sprintf("unexpected selector base type %s (%s)",
+				dtv.T.String(), reflect.TypeOf(dtv.T)))
+		}
+	case VPSubrefField:
+		switch ct := baseOf(dtv.T).(type) {
+		case *StructType:
+			return dtv.V.(*StructValue).GetSubrefPointerTo(store, ct, path)
+		default:
+			panic(fmt.Sprintf("unexpected (subref) selector base type %s (%s)",
+				dtv.T.String(), reflect.TypeOf(dtv.T)))
+		}
+	case VPValMethod:
+		dt := dtv.T.(*DeclaredType)
+		mtv := dt.GetValueAt(alloc, store, path)
+		mv := mtv.GetFunc()
+		mt := mv.GetType(store)
+		if debug {
+			if mt.HasPointerReceiver() {
+				panic("should not happen")
+			}
+		}
+		// A value receiver is a fresh copy the method body may mutate without
+		// touching the original; clear readonly on the copy (other rules still
+		// apply, e.g. in DidUpdate).
+		rtv := dtv.Copy(alloc)
+		if rtv.V != nil {
+			rtv.N = [8]byte{}
+		}
+		alloc.AllocateBoundMethod()
+		bmv := &BoundMethodValue{
+			Func:     mv,
+			Receiver: rtv,
+		}
+		// Bound method wrapper belongs to the realm doing the
+		// binding; the receiver carries its own PkgID independently.
+		// Pass nil to stamp with currentRealmID.
+		alloc.stampPkgID(&bmv.ObjectInfo, nil)
+		return PointerValue{
+			TV: &TypedValue{
+				T: mt.BoundType(),
+				V: bmv,
+			},
+			Base: nil, // a bound method is free floating.
+		}
+	case VPPtrMethod:
+		dt := tv.T.(*PointerType).Elt.(*DeclaredType)
+		// ^ support nil receivers, vs:
+		// dt := dtv.T.(*DeclaredType)
+		mtv := dt.GetValueAt(alloc, store, path)
+		mv := mtv.GetFunc()
+		mt := mv.GetType(store)
+		if debug {
+			if !mt.HasPointerReceiver() {
+				panic("should not happen")
+			}
+			if !isPtr {
+				panic("should not happen")
+			}
+			if tv.T.Kind() != PointerKind {
+				panic("should not happen")
+			}
+		}
+		ptv := *tv
+		if ptv.V != nil {
+			// Clear readonly for receivers.
+			// Other rules still apply such as in DidUpdate.
+			// NOTE: ptv is a copy, orig is untouched.
+			ptv.N = [8]byte{}
+		}
+		alloc.AllocateBoundMethod()
+		bmv := &BoundMethodValue{
+			Func:     mv,
+			Receiver: ptv, // bound to tv ptr, not dtv.
+		}
+		// Bound method wrapper belongs to the realm doing the binding.
+		// Pass nil to stamp with currentRealmID.
+		alloc.stampPkgID(&bmv.ObjectInfo, nil)
+		return PointerValue{
+			TV: &TypedValue{
+				T: mt.BoundType(),
+				V: bmv,
+			},
+			Base: nil, // a bound method is free floating.
+		}
+	case VPInterface:
+		if dtv.IsUndefined() {
+			panic(&Exception{Value: typedRuntimeError("runtime error: method selector on nil interface")})
+		}
+		if dtv.T.Kind() == InterfaceKind {
+			panic("cannot resolve an interface path at static time")
+		}
+		if callerPath == "" {
+			callerPath = dtv.T.GetPkgPath()
+		}
+		_, _, _, ift, status := findEmbeddedFieldType(gm, callerPath, dtv.T, path.Name)
+		if status != embedLookupFound {
+			panic(fmt.Sprintf("method %s not found in type %s",
+				path.Name, dtv.T.String()))
+		}
+		// Lazy interface dispatch (matches Go): a method value formed through
+		// an interface saves the operand at formation; the concrete method and
+		// receiver are materialized inside the CALL. So bind a lazy method
+		// value holding the saved operand (the boxed value/pointer) + selector
+		// name, and resolve at call time via resolveLazyBound. This gives Go's
+		// call-time semantics on every facet — deref timing, value snapshot,
+		// nil panic, field re-read through a pointer, and dynamic re-dispatch —
+		// because the operand is re-walked live at the call. ift is the bound
+		// (receiver-stripped) method type, known statically from the interface.
+		alloc.AllocateBoundMethod()
+		bmv := &BoundMethodValue{
+			Func:      nil, // resolved at call (see resolveLazyBound)
+			Receiver:  *dtv,
+			Method:    path.Name,
+			MethodPkg: callerPath,
+		}
+		alloc.stampPkgID(&bmv.ObjectInfo, nil)
+		return PointerValue{
+			TV: &TypedValue{
+				T: ift.(*FuncType),
+				V: bmv,
+			},
+			Base: nil,
+		}
+	default:
+		panic("should not happen")
+	}
+}
+
+// Convenience for GetPointerAtIndex(). Slow.
+func (tv *TypedValue) GetPointerAtIndexInt(store Store, ii int) PointerValue {
+	iv := TypedValue{T: IntType}
+	iv.SetInt(int64(ii))
+	return tv.GetPointerAtIndex(nil, nilRealm, nil, store, &iv)
+}
+
+// GetByteAtIndexInt is a read-only fast path of GetPointerAtIndex for
+// strings and Data-backed (byte) arrays and slices: it returns the element
+// value directly instead of materializing a heap-allocated pointer box
+// (see GetElementPointer) that the caller immediately Derefs and
+// discards. ok is false when tv is none of those (maps, List-backed arrays
+// and slices), in which case the caller must use GetPointerAtIndex. Checks
+// and panics mirror GetPointerAtIndex: out-of-range indices raise explicit
+// Exceptions for strings, arrays and slices, so they stay recoverable rather
+// than escaping as un-recoverable Go panics (see #5738).
+func (tv *TypedValue) GetByteAtIndexInt(store Store, ii int) (res TypedValue, ok bool) {
+	switch bt := baseOf(tv.T).(type) {
+	case PrimitiveType:
+		if bt == StringType || bt == UntypedStringType {
+			sv := tv.GetString()
+			if ii >= len(sv) {
+				panic(&Exception{Value: typedRuntimeError(fmt.Sprintf("runtime error: index out of range [%d] with length %d", ii, len(sv)))})
+			}
+			if ii < 0 {
+				panic(&Exception{Value: typedRuntimeError(fmt.Sprintf("runtime error: invalid slice index %d (index must be non-negative)", ii))})
+			}
+			res = TypedValue{T: Uint8Type}
+			res.SetUint8(sv[ii])
+			return res, true
+		}
+	case *ArrayType:
+		if av, aok := tv.V.(*ArrayValue); aok && av.Data != nil {
+			if ii < 0 {
+				panic(&Exception{Value: typedRuntimeError(fmt.Sprintf("runtime error: index out of range [%d]", ii))})
+			}
+			if ii >= len(av.Data) {
+				panic(&Exception{Value: typedRuntimeError(fmt.Sprintf("runtime error: index out of range [%d] with length %d", ii, len(av.Data)))})
+			}
+			res = TypedValue{T: bt.Elt}
+			res.SetUint8(av.Data[ii])
+			return res, true
+		}
+	case *SliceType:
+		if tv.V == nil {
+			panic(&Exception{Value: typedRuntimeError("runtime error: nil slice index (out of bounds)")})
+		}
+		if sv, sok := tv.V.(*SliceValue); sok {
+			if base := sv.GetBase(store); base.Data != nil {
+				if ii < 0 {
+					panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+						"runtime error: slice index out of bounds: %d", ii,
+					))})
+				} else if sv.Length <= ii {
+					panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+						"runtime error: slice index out of bounds: %d (len=%d)",
+						ii, sv.Length,
+					))})
+				}
+				res = TypedValue{T: bt.Elt}
+				res.SetUint8(base.Data[sv.Offset+ii])
+				return res, true
+			}
+		}
+	}
+	return TypedValue{}, false
+}
+
+func (tv *TypedValue) GetPointerAtIndex(m *Machine, rlm *Realm, alloc *Allocator, store Store, iv *TypedValue) PointerValue {
+	switch bt := baseOf(tv.T).(type) {
+	case PrimitiveType:
+		if bt == StringType || bt == UntypedStringType {
+			sv := tv.GetString()
+			ii := int(iv.ConvertGetInt())
+			// heap alloc; GetByteAtIndexInt optimizes this if you Deref the result.
+			btv := &TypedValue{
+				T: Uint8Type,
+			}
+
+			if ii >= len(sv) {
+				panic(&Exception{Value: typedRuntimeError(fmt.Sprintf("runtime error: index out of range [%d] with length %d", ii, len(sv)))})
+			}
+			if ii < 0 {
+				panic(&Exception{Value: typedRuntimeError(fmt.Sprintf("runtime error: invalid slice index %d (index must be non-negative)", ii))})
+			}
+
+			btv.SetUint8(sv[ii])
+			return PointerValue{
+				TV:   btv,
+				Base: nil, // free floating
+			}
+		}
+		panic(fmt.Sprintf(
+			"primitive type %s cannot be indexed",
+			tv.T.String(),
+		))
+	case *ArrayType:
+		av := tv.V.(*ArrayValue)
+		ii := int(iv.ConvertGetInt())
+		return av.GetElementPointer(store, ii, bt.Elt)
+	case *SliceType:
+		if tv.V == nil {
+			panic(&Exception{Value: typedRuntimeError("runtime error: nil slice index (out of bounds)")})
+		}
+		sv := tv.V.(*SliceValue)
+		ii := int(iv.ConvertGetInt())
+		return sv.GetElementPointer(store, ii, bt.Elt)
+	case *MapType:
+		if tv.V == nil {
+			panic(&Exception{Value: typedRuntimeError("runtime error: uninitialized map index")})
+		}
+		mv := tv.V.(*MapValue)
+
+		// if a key is getting attached, we should update it with the new one,
+		// as that is the one that matters. this is mostly relevant for -0 / 0.
+		// https://github.com/gnolang/gno/pull/4114
+		var oldObject Object
+		// Meter from m: the nil-m path (GetPointerAtIndexInt) only ever
+		// indexes slices/strings, so no map-key gas is lost there.
+		var gm types.GasMeter
+		if m != nil {
+			gm = m.GasMeter
+		}
+		key, isNaN := iv.ComputeMapKey(gm, store, false)
+		if !isNaN {
+			k, ok := mv.vmap[key]
+			if ok {
+				oldObject = k.Key.GetFirstObject(store)
+			}
+		}
+
+		ivk := iv.Copy(alloc)
+		// key was already computed (and charged) from iv above, and ivk is a
+		// value-copy of iv, so recomputing it here would return the same
+		// MapKey and charge twice.
+		pv := mv.getPointerForComputedKey(alloc, key, isNaN, ivk)
+		if pv.TV.IsUndefined() {
+			vt := baseOf(tv.T).(*MapType).Value
+			if vt.Kind() != InterfaceKind {
+				// this will get assigned over but the zero-init still
+				// walks struct fields; use the caller's alloc.
+				*pv.TV = defaultTypedValue(alloc, vt)
+			}
+		}
+		// Attach mapkey object to the map's ownership tree if changed.
+		// Only PopAsPointer2 (write path) reaches here with non-nil rlm,
+		// and it checks readonly before calling.
+		// Read paths (doOpIndex, debugger) pass nilRealm → DidUpdate is a no-op.
+		newObject := ivk.GetFirstObject(store)
+		if oldObject != newObject {
+			rlm.DidUpdate(m, mv, oldObject, newObject)
+		}
+
+		return pv
+	default:
+		panic(fmt.Sprintf(
+			"unexpected index base type %s (%v base %v)",
+			tv.T.String(),
+			reflect.TypeOf(tv.T),
+			reflect.TypeOf(baseOf(tv.T)),
+		))
+	}
+}
+
+func (tv *TypedValue) SetType(tt Type) {
+	tvv := tv.V.(TypeValue)
+	tvv.Type = tt
+	tv.V = tvv
+}
+
+func (tv *TypedValue) GetType() Type {
+	return tv.V.(TypeValue).Type
+}
+
+// GetFunc returns the *FuncValue, or nil for a typed-nil func variable
+// (e.g. `var f func()`). Panics if tv.V holds an unexpected type — most
+// notably *BoundMethodValue, which callers must reach via GetUnboundFunc.
+func (tv *TypedValue) GetFunc() *FuncValue {
+	switch fv := tv.V.(type) {
+	case nil:
+		return nil
+	case *FuncValue:
+		return fv
+	default:
+		panic(fmt.Sprintf("expected *FuncValue or nil but got %T", tv.V))
+	}
+}
+
+// GetUnboundFunc returns the underlying *FuncValue for both plain funcs
+// and bound methods (stripping the receiver), or nil for a typed-nil
+// func/method variable. Panics on any other type.
+//
+// A lazy interface bind (BoundMethodValue.IsLazy()) also returns nil — its
+// concrete func doesn't exist until call time — so callers must not read nil
+// as "typed-nil func" without checking the value shape.
+func (tv *TypedValue) GetUnboundFunc() *FuncValue {
+	switch fv := tv.V.(type) {
+	case nil:
+		return nil
+	case *FuncValue:
+		return fv
+	case *BoundMethodValue:
+		return fv.Func // nil for a lazy bind: bmv exists, concrete func doesn't yet
+	default:
+		panic(fmt.Sprintf("expected func/method or nil but got %T", tv.V))
+	}
+}
+
+func (tv *TypedValue) GetLength() int {
+	if tv.V == nil {
+		switch bt := baseOf(tv.T).(type) {
+		case PrimitiveType:
+			if bt != StringType {
+				panic(fmt.Sprintf("unexpected type for len(): %s", tv.T.String()))
+			}
+			return 0
+		case *ArrayType:
+			return bt.Len
+		case *SliceType:
+			return 0
+		case *MapType:
+			return 0
+		case *PointerType:
+			if at, ok := bt.Elt.(*ArrayType); ok {
+				return at.Len
+			}
+			panic(fmt.Sprintf("unexpected type for len(): %s", tv.T.String()))
+		default:
+			panic(fmt.Sprintf(
+				"unexpected type for len(): %s",
+				bt.String(),
+			))
+		}
+	}
+	switch cv := tv.V.(type) {
+	case StringValue:
+		return len(cv)
+	case *ArrayValue:
+		return cv.GetLength()
+	case *SliceValue:
+		return cv.GetLength()
+	case *MapValue:
+		return cv.GetLength()
+	case PointerValue:
+		if av, ok := cv.TV.V.(*ArrayValue); ok {
+			return av.GetLength()
+		}
+		panic(fmt.Sprintf("unexpected type for len(): %s", tv.T.String()))
+	default:
+		panic(fmt.Sprintf("unexpected type for len(): %s",
+			tv.T.String()))
+	}
+}
+
+func (tv *TypedValue) GetCapacity() int {
+	if tv.V == nil {
+		// assert acceptable type.
+		switch bt := baseOf(tv.T).(type) {
+		// strings have no capacity.
+		case *ArrayType:
+			return bt.Len
+		case *SliceType:
+			return 0
+		case *PointerType:
+			if at, ok := bt.Elt.(*ArrayType); ok {
+				return at.Len
+			}
+			panic(fmt.Sprintf("unexpected type for cap(): %s", tv.T.String()))
+		default:
+			panic(fmt.Sprintf("unexpected type for cap(): %s", tv.T.String()))
+		}
+	}
+	switch cv := tv.V.(type) {
+	case *ArrayValue:
+		return cv.GetCapacity()
+	case *SliceValue:
+		return cv.GetCapacity()
+	case PointerValue:
+		if av, ok := cv.TV.V.(*ArrayValue); ok {
+			return av.GetCapacity()
+		}
+		panic(fmt.Sprintf("unexpected type for cap(): %s", tv.T.String()))
+	default:
+		panic(fmt.Sprintf("unexpected type for cap(): %s",
+			tv.T.String()))
+	}
+}
+
+func (tv *TypedValue) GetSlice(alloc *Allocator, low, high int) TypedValue {
+	if low < 0 {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+			"runtime error: invalid slice index %d (index must be non-negative)",
+			low,
+		))})
+	}
+	if high < 0 {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+			"runtime error: invalid slice index %d (index must be non-negative)",
+			low,
+		))})
+	}
+	if low > high {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+			"runtime error: invalid slice index %d > %d",
+			low, high,
+		))})
+	}
+	switch t := baseOf(tv.T).(type) {
+	case PrimitiveType:
+		if tv.GetLength() < high {
+			panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+				"runtime error: slice bounds out of range [%d:%d] with string length %d",
+				low, high, tv.GetLength(),
+			))})
+		}
+		if t == StringType || t == UntypedStringType {
+			return TypedValue{
+				T: tv.T,
+				V: alloc.NewString(tv.GetString()[low:high]),
+			}
+		}
+		panic(&Exception{Value: typedString(
+			"non-string primitive type cannot be sliced",
+		)})
+	case *ArrayType:
+		if tv.GetLength() < high {
+			panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+				"runtime error: slice bounds out of range [%d:%d] with array length %d",
+				low, high, tv.GetLength(),
+			))})
+		}
+		av := tv.V.(*ArrayValue)
+		st := alloc.NewType(&SliceType{
+			Elt: t.Elt,
+			Vrd: false,
+		})
+		return TypedValue{
+			T: st,
+			V: alloc.NewSlice(
+				av,                   // base
+				low,                  // offset
+				high-low,             // length
+				av.GetCapacity()-low, // maxcap
+			),
+		}
+	case *SliceType:
+		// XXX consider restricting slice expansion if slice is readonly.
+		if tv.GetCapacity() < high {
+			panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+				"runtime error: slice bounds out of range [%d:%d] with capacity %d",
+				low, high, tv.GetCapacity(),
+			))})
+		}
+		if tv.V == nil {
+			if low != 0 || high != 0 {
+				panic(&Exception{Value: typedRuntimeError("runtime error: nil slice index out of range")})
+			}
+			return TypedValue{
+				T: tv.T,
+				V: nil,
+			}
+		}
+		sv := tv.V.(*SliceValue)
+		return TypedValue{
+			T: tv.T,
+			V: alloc.NewSlice(
+				sv.Base,       // base
+				sv.Offset+low, // offset
+				high-low,      // length
+				sv.Maxcap-low, // maxcap
+			),
+		}
+	default:
+		panic(fmt.Sprintf("unexpected type for GetSlice(): %s",
+			tv.T.String()))
+	}
+}
+
+func (tv *TypedValue) GetSlice2(alloc *Allocator, lowVal, highVal, maxVal int) TypedValue {
+	if lowVal < 0 {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+			"runtime error: invalid slice index %d (index must be non-negative)",
+			lowVal,
+		))})
+	}
+	if highVal < 0 {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+			"runtime error: invalid slice index %d (index must be non-negative)",
+			highVal,
+		))})
+	}
+	if maxVal < 0 {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+			"runtime error: invalid slice index %d (index must be non-negative)",
+			maxVal,
+		))})
+	}
+	if lowVal > highVal {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+			"runtime error: invalid slice index %d > %d",
+			lowVal, highVal,
+		))})
+	}
+	if highVal > maxVal {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+			"runtime error: invalid slice index %d > %d",
+			highVal, maxVal,
+		))})
+	}
+	if tv.GetCapacity() < highVal {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+			"runtime error: slice bounds out of range [%d:%d:%d] with capacity %d",
+			lowVal, highVal, maxVal, tv.GetCapacity(),
+		))})
+	}
+	if tv.GetCapacity() < maxVal {
+		panic(&Exception{Value: typedRuntimeError(fmt.Sprintf(
+			"runtime error: slice bounds out of range [%d:%d:%d] with capacity %d",
+			lowVal, highVal, maxVal, tv.GetCapacity(),
+		))})
+	}
+	switch bt := baseOf(tv.T).(type) {
+	case *ArrayType:
+		av := tv.V.(*ArrayValue)
+		st := alloc.NewType(&SliceType{
+			Elt: bt.Elt,
+			Vrd: false,
+		})
+		return TypedValue{
+			T: st,
+			V: alloc.NewSlice(
+				av,             // base
+				lowVal,         // low
+				highVal-lowVal, // length
+				maxVal-lowVal,  // maxcap
+			),
+		}
+	case *SliceType:
+		// XXX consider restricting slice expansion if slice is readonly.
+		if tv.V == nil {
+			if lowVal != 0 || highVal != 0 || maxVal != 0 {
+				panic(&Exception{Value: typedRuntimeError("runtime error: nil slice index out of range")})
+			}
+			return TypedValue{
+				T: tv.T,
+				V: nil,
+			}
+		}
+		sv := tv.V.(*SliceValue)
+		return TypedValue{
+			T: tv.T,
+			V: alloc.NewSlice(
+				sv.Base,          // base
+				sv.Offset+lowVal, // offset
+				highVal-lowVal,   // length
+				maxVal-lowVal,    // maxcap
+			),
+		}
+	default:
+		panic(fmt.Sprintf("unexpected type for GetSlice2(): %s",
+			tv.T.String()))
+	}
+}
+
+// Convenience for Value.DeepFill.
+// NOTE: NOT LAZY (and potentially expensive)
+func (tv *TypedValue) DeepFill(store Store) {
+	if tv.V != nil {
+		tv.V = tv.V.DeepFill(store)
+	}
+}
+
+// ----------------------------------------
+// Block
+//
+// Blocks hold values referred to by var/const/func/type declarations in
+// BlockNodes such as packages, functions, and switch statements.  Unlike
+// structs or packages, names and paths may refer to parent blocks.  (In the
+// future, the same mechanism may be used to support inheritance or
+// prototype-like functionality for structs and packages.)
+//
+// When a block would otherwise become gc'd because it is no longer used, the
+// block is forgotten and GC'd.
+//
+// Variables declared in a closure or passed by reference are first discovered
+// and marked as such from the preprocessor, and NewBlock() will prepopulate
+// these slots with *HeapItemValues.  When a *HeapItemValue (or sometimes
+// HeapItemType in .T) is present in a block slot it is not written over but
+// instead the value is written into the heap item's slot--except for loopvars
+// assignments which may replace the heap item with another one. This is
+// how Gno supports Go1.22 loopvars.
+// TODO XXX rename to BlockValue
+type Block struct {
+	ObjectInfo
+	Source   BlockNode
+	Values   []TypedValue
+	Parent   Value
+	Blank    TypedValue // captures "_" // XXX remove and replace with global instance.
+	bodyStmt bodyStmt   // XXX expose for persistence, not needed for MVP.
+
+	// poisoned marks a block that has been returned to the machine's block
+	// pool (see Machine.releaseBlock). It only carries meaning under the
+	// debugAssert build tag, where PointerValue.Deref/Assign2 panic on a
+	// pointer whose Base is a poisoned block — turning a use-after-recycle
+	// (which would otherwise be silent corruption once the block is reused)
+	// into a loud failure. Set on release, cleared on acquire; not persisted.
+	poisoned bool
+}
+
+// Growth policy for Block.Values, in slots (not bytes). Doubling keeps
+// repeated small expansions amortized; past the threshold it tapers to fixed
+// steps so a large block does not overshoot by its own size again.
+//
+// This mirrors the shape of Go's growslice — double while small, taper once
+// large — without inheriting its numbers, which are an unspecified runtime
+// detail we must not depend on. For reference, go1.25's runtime/slice.go
+// tapers at oldCap >= 256 elements and then grows by
+// `newcap += (newcap + 3*256) >> 2`, i.e. ~1.25x plus 192, before rounding up
+// to a malloc size class. Ours tapers later and grows more slowly, which wastes
+// less of the capacity we now charge for.
+const (
+	blockValuesGrowThreshold = 512
+	blockValuesGrowIncrement = 256
+)
+
+// growBlockValues returns values resized to numNames, growing the backing
+// array per the policy above when it does not fit. Contents up to len(values)
+// are preserved.
+//
+// It does NOT guarantee that the newly exposed slots are zero: when the backing
+// array already has room it simply re-slices, so slots in [len(values):numNames]
+// hold whatever that array last held. (A pooled block's tail is zeroed by
+// Machine.releaseBlock, and a freshly make()'d one starts zero, so in practice
+// they are — but do not rely on it.) Every caller must write each slot it
+// exposes; ExpandWith, PrepareNewValues and StaticBlock.Define2 all do.
+//
+// This exists instead of plain append (or slices.Grow, which is append
+// underneath) because cap(Block.Values) is consensus-visible: it is the real
+// retained footprint of the block, and so what (*Block).GetShallowSize
+// charges. append picks its capacity in growslice, an unspecified runtime
+// detail that has changed across releases and overshoots what was asked for
+// (request 14 slots, get 28) — routing block growth through it would both make
+// allocation gas depend on the toolchain and roughly double the charge. The
+// policy below is ours, so cap is a pure function of the program.
+func growBlockValues(values []TypedValue, numNames int) []TypedValue {
+	if cap(values) >= numNames {
+		return values[:numNames]
+	}
+	newCap := max(cap(values), 1)
+	for newCap < numNames && newCap < blockValuesGrowThreshold {
+		newCap *= 2
+	}
+	if short := numNames - newCap; short > 0 {
+		steps := (short + blockValuesGrowIncrement - 1) / blockValuesGrowIncrement
+		newCap += steps * blockValuesGrowIncrement
+	}
+	grown := make([]TypedValue, numNames, newCap)
+	copy(grown, values)
+	return grown
+}
+
+// normalizeDecodedCap trims a store-decoded block's Values capacity to its
+// length. Amino builds slices with reflect.Append, so the capacity it leaves
+// behind is whatever Go's growslice chose; since cap(Block.Values) is what
+// GetShallowSize charges, that capacity must not leak into allocation gas.
+// The other paths that size Values are already deterministic: the explicit
+// make() in newBlockWithValueCap, our doubling in growBlockValues, and the
+// exact three-index re-slice in Machine.releaseBlock.
+func normalizeDecodedCap(oo Object) {
+	if b, ok := oo.(*Block); ok {
+		b.Values = b.Values[:len(b.Values):len(b.Values)]
+	}
+}
+
+// initHeapItems prepopulates the heap-item slots of a block's values per
+// source.GetHeapItems(); these slots must always hold heap items. Used by
+// NewBlock and Machine.acquireBlock. Keep in sync with ExpandWith().
+func initHeapItems(alloc *Allocator, values []TypedValue, source BlockNode) {
+	for i, isHeap := range source.GetHeapItems() {
+		if !isHeap {
+			continue
+		}
+		values[i] = TypedValue{
+			T: heapItemType{},
+			V: alloc.NewHeapItem(nil, TypedValue{}),
+		}
+	}
+}
+
+// NOTE: for allocation, use *Allocator.NewBlock.
+func NewBlock(alloc *Allocator, source BlockNode, parent *Block) *Block {
+	return newBlockWithValueCap(alloc, source, parent, 0)
+}
+
+// newBlockWithValueCap is NewBlock with a minimum Values capacity, clamped up
+// to numNames (pass minCap 0 for an exact fit). The pool uses minCap to
+// over-allocate so recycled blocks serve most later acquires; see
+// blockPoolValueCap.
+//
+// Callers should call alloc.AllocateBlock as appropriate - alloc is only used
+// when creating heap items.
+func newBlockWithValueCap(alloc *Allocator, source BlockNode, parent *Block, minCap int) *Block {
+	numNames := int(source.GetNumNames())
+	capacity := max(minCap, numNames)
+	values := make([]TypedValue, numNames, capacity)
+	initHeapItems(alloc, values, source)
+	blk := &Block{
+		Source: source,
+		Values: values,
+		Parent: parent,
+	}
+	// Blocks belong to the executing realm (currentRealmID),
+	// representing a lexical scope inside that realm's running code.
+	// Pass nil to stamp with currentRealmID.
+	alloc.stampPkgID(&blk.ObjectInfo, nil)
+	return blk
+}
+
+func (b *Block) GetSource(store Store) BlockNode {
+	if rn, ok := b.Source.(RefNode); ok {
+		source := store.GetBlockNode(rn.GetLocation())
+		b.Source = source
+		return source
+	}
+	return b.Source
+}
+
+func (b *Block) GetParent(store Store) *Block {
+	switch pb := b.Parent.(type) {
+	case nil:
+		return nil
+	case *Block:
+		return pb
+	case RefValue:
+		block := store.GetObject(pb.ObjectID).(*Block)
+		b.Parent = block
+		return block
+	default:
+		panic("should not happen")
+	}
+}
+
+func (b *Block) GetPointerToInt(store Store, index int) PointerValue {
+	vv := fillValueTV(store, &b.Values[index])
+	if hiv, ok := vv.V.(*HeapItemValue); ok {
+		fillValueTV(store, &hiv.Value)
+		return PointerValue{
+			TV:    &hiv.Value,
+			Base:  vv.V,
+			Index: 0,
+		}
+	} else {
+		return PointerValue{
+			TV:    vv,
+			Base:  b,
+			Index: index,
+		}
+	}
+}
+
+func (b *Block) GetPointerToIntDirect(store Store, index int) PointerValue {
+	vv := fillValueTV(store, &b.Values[index])
+	return PointerValue{
+		TV:    vv,
+		Base:  b,
+		Index: index,
+	}
+}
+
+func (b *Block) GetPointerTo(store Store, path ValuePath) PointerValue {
+	if path.IsBlockBlankPath() {
+		if debug {
+			if path.Name != blankIdentifier {
+				panic(fmt.Sprintf(
+					"zero value path is reserved for \"_\", but got %s",
+					path.Name,
+				))
+			}
+		}
+		return PointerValue{
+			TV:    b.GetBlankRef(),
+			Base:  b,
+			Index: PointerIndexBlockBlank, // -1
+		}
+	}
+	// NOTE: For most block paths, Depth starts at 1, but
+	// the generation for uverse is 0.  If path.Depth is
+	// 0, it implies that b == uverse, and the condition
+	// would fail as if it were 1.
+	for i := uint8(1); i < path.Depth; i++ {
+		b = b.GetParent(store)
+	}
+	return b.GetPointerToInt(store, int(path.Index))
+}
+
+func (b *Block) GetPointerToDirect(store Store, path ValuePath) PointerValue {
+	if path.IsBlockBlankPath() {
+		if debug {
+			if path.Name != blankIdentifier {
+				panic(fmt.Sprintf(
+					"zero value path is reserved for \"_\", but got %s",
+					path.Name,
+				))
+			}
+		}
+		return PointerValue{
+			TV:    b.GetBlankRef(),
+			Base:  b,
+			Index: PointerIndexBlockBlank, // -1
+		}
+	}
+	// NOTE: For most block paths, Depth starts at 1, but
+	// the generation for uverse is 0.  If path.Depth is
+	// 0, it implies that b == uverse, and the condition
+	// would fail as if it were 1.
+	for i := uint8(1); i < path.Depth; i++ {
+		b = b.GetParent(store)
+	}
+	return b.GetPointerToIntDirect(store, int(path.Index))
+}
+
+// First defines a new HeapItemValue if heap slot.
+func (b *Block) GetPointerToMaybeHeapDefine(store Store, nx *NameExpr) PointerValue {
+	switch nx.Type {
+	case NameExprTypeNormal:
+		// XXX convert rangestmt switchstmt names
+		// into NameExpr and then panic here instead.
+		return b.GetPointerTo(store, nx.Path)
+	case NameExprTypeDefine:
+		return b.GetPointerTo(store, nx.Path)
+	case NameExprTypeHeapDefine:
+		path := nx.Path
+		ptr := b.GetPointerToDirect(store, path)
+		if _, ok := ptr.TV.T.(heapItemType); ok {
+			if nx.Type != NameExprTypeHeapDefine {
+				panic("expected name expr heap define type")
+			}
+			hiv := &HeapItemValue{}
+			// Heap slot inherits the Block's PkgID (the lexical
+			// scope's realm).
+			hiv.ObjectInfo.SetPkgID(b.ObjectInfo.ID.PkgID)
+			*ptr.TV = TypedValue{
+				T: heapItemType{},
+				V: hiv,
+			}
+			return PointerValue{
+				TV:    &hiv.Value,
+				Base:  hiv,
+				Index: 0,
+			}
+		} else {
+			return ptr
+		}
+	default:
+		panic("unexpected NameExpr type for GetPointerToMaybeHeapDefine")
+	}
+}
+
+// Result is used has lhs for any assignments to "_".
+func (b *Block) GetBlankRef() *TypedValue {
+	return &b.Blank
+}
+
+// Convenience for implementing nativeBody functions.
+func (b *Block) GetParams1(store Store) (pv1 PointerValue) {
+	pv1 = b.GetPointerTo(store, NewValuePathBlock(1, 0, ""))
+	return
+}
+
+// Convenience for implementing nativeBody functions.
+func (b *Block) GetParams2(store Store) (pv1, pv2 PointerValue) {
+	pv1 = b.GetPointerTo(store, NewValuePathBlock(1, 0, ""))
+	pv2 = b.GetPointerTo(store, NewValuePathBlock(1, 1, ""))
+	return
+}
+
+// Convenience for implementing nativeBody functions.
+func (b *Block) GetParams3(store Store) (pv1, pv2, pv3 PointerValue) {
+	pv1 = b.GetPointerTo(store, NewValuePathBlock(1, 0, ""))
+	pv2 = b.GetPointerTo(store, NewValuePathBlock(1, 1, ""))
+	pv3 = b.GetPointerTo(store, NewValuePathBlock(1, 2, ""))
+	return
+}
+
+func (b *Block) GetBodyStmt() *bodyStmt {
+	return &b.bodyStmt
+}
+
+// Used by faux blocks like IfCond and SwitchStmt upon clause match.  e.g.
+// source: IfCond, b.Source: IfStmt.  Also used by repl to expand block size
+// dynamically. In that case source == b.Source.
+// See also PackageNode.PrepareNewValues().
+func (b *Block) ExpandWith(alloc *Allocator, source BlockNode) {
+	sb := source.GetStaticBlock()
+	numNames := int(sb.GetNumNames())
+	if len(b.Values) > numNames {
+		panic(fmt.Sprintf(
+			"unexpected block size shrinkage: %v vs %v",
+			len(b.Values), numNames,
+		))
+	}
+	if numNames == len(b.Values) {
+		return // nothing to do
+	}
+	oldNames := len(b.Values)
+	newNames := numNames - oldNames
+	alloc.AllocateBlockItems(int64(newNames))
+	heapItems := source.GetHeapItems()
+	bvalues := growBlockValues(b.Values, numNames)
+	for i := oldNames; i < numNames; i++ {
+		tv := sb.Values[i]
+		if heapItems[i] {
+			// Heap-slot wrapper is anonymous; nil t skips the
+			// construction-time check (the contained value's
+			// type may be cross-realm but the slot itself isn't).
+			bvalues[i] = TypedValue{
+				T: heapItemType{},
+				V: alloc.NewHeapItem(nil, tv),
+			}
+		} else {
+			bvalues[i] = tv
+		}
+	}
+	b.Values = bvalues
+	b.Source = source // otherwise new variables won't show in print or debugger.
+}
+
+// RefValue.PkgPath is set if the RefValue refers to a local package or an
+// external package and originates from a name by the preprocessor.  In this
+// case .ObjectID cannot be set because it may not yet be real.
+// NOTE: RefValue Object methods declared in ownership.go
+type RefValue struct {
+	ObjectID ObjectID  `json:",omitempty"` // If non-zero, PkgPath is empty
+	PkgPath  string    `json:",omitempty"` // If set, ObjectID is non-zero
+	Hash     ValueHash `json:",omitempty"` // Set iff not escaped
+}
+
+func RefValueFromPackage(pv *PackageValue) RefValue {
+	return RefValue{PkgPath: pv.PkgPath}
+}
+
+// Returns .ObjectID.
+// Does not derive ObjectID from PkgPath if of form RefValue{PkgPath}.
+// TODO: consider splitting into another value type to prevent confusion.
+func (rv RefValue) GetObjectID() ObjectID {
+	if rv.PkgPath != "" {
+		panic("unexpected ref value of form RefValue{PkgPath}")
+	}
+	return rv.ObjectID
+}
+
+// Base for a detached singleton (e.g. new(int) or &struct{})
+// Conceptually like a Block that holds one value.
+// NOTE: It is possible for the value to be external
+// while the heap item itself is not; but this
+// should not be possible w/ blocks or struct values.
+// See test/files/zrealm_crossrealm25a.gno.
+// NOTE: could be renamed to HeapItemBaseValue.
+// See also note in realm.go about auto-unwrapping.
+type HeapItemValue struct {
+	ObjectInfo
+	Value TypedValue
+}
+
+// ----------------------------------------
+
+func defaultStructFields(alloc *Allocator, st *StructType) []TypedValue {
+	tvs := alloc.NewStructFields(len(st.Fields))
+	// tvs is a Go local, so anchor it while the defaults are built: each
+	// default is a fresh allocation, and a GC triggered by a later field
+	// would otherwise drop the earlier ones from the tally and re-grant
+	// the cap. See Allocator.anchors.
+	alloc.PushAnchor(tvs)
+	fillDefaultStructFields(alloc, st, tvs)
+	alloc.PopAnchor()
+	return tvs
+}
+
+// fillDefaultStructFields writes st's zero values into tvs, which must have
+// len(st.Fields) entries. The caller is responsible for anchoring tvs (see
+// Allocator.anchors) — doOpStructLit keeps its own anchor for the whole op.
+func fillDefaultStructFields(alloc *Allocator, st *StructType, tvs []TypedValue) {
+	for i, ft := range st.Fields {
+		if ft.Type.Kind() != InterfaceKind {
+			tvs[i] = defaultTypedValue(alloc, ft.Type)
+		}
+	}
+}
+
+func defaultStructValue(alloc *Allocator, st *StructType) *StructValue {
+	return alloc.NewStruct(
+		st,
+		defaultStructFields(alloc, st),
+	)
+}
+
+func defaultArrayValue(alloc *Allocator, at *ArrayType) *ArrayValue {
+	if at.Elt.Kind() == Uint8Kind {
+		return alloc.NewDataArray(at, at.Len)
+	}
+	av := alloc.NewListArray(at, at.Len)
+	tvs := av.List
+	if et := at.Elem(); et.Kind() != InterfaceKind {
+		// av is a Go local until the caller roots it, so anchor its list
+		// while the defaults are built: without it a GC part-way through
+		// drops the elements already written and the cap is re-granted
+		// once per element. See Allocator.anchors.
+		alloc.PushAnchor(tvs)
+		for i := range at.Len {
+			tvs[i] = defaultTypedValue(alloc, et)
+		}
+		alloc.PopAnchor()
+	}
+	return av
+}
+
+func defaultTypedValue(alloc *Allocator, t Type) TypedValue {
+	switch ct := baseOf(t).(type) {
+	case nil:
+		panic("unexpected nil type")
+	case *InterfaceType:
+		return TypedValue{}
+	case *ArrayType:
+		return TypedValue{
+			T: t,
+			V: defaultArrayValue(alloc, ct),
+		}
+	case *StructType:
+		return TypedValue{
+			T: t,
+			V: defaultStructValue(alloc, ct),
+		}
+	case *SliceType:
+		return TypedValue{
+			T: t,
+			V: nil,
+		}
+	case *MapType:
+		return TypedValue{
+			T: t,
+			V: nil,
+		}
+	default:
+		return TypedValue{
+			T: t,
+			V: nil,
+		}
+	}
+}
+
+func typedInt(i int) TypedValue {
+	tv := TypedValue{T: IntType}
+	tv.SetInt(int64(i))
+	return tv
+}
+
+func typedBool(b bool) TypedValue {
+	tv := TypedValue{T: BoolType}
+	tv.SetBool(b)
+	return tv
+}
+
+func untypedBool(b bool) TypedValue {
+	tv := TypedValue{T: UntypedBoolType}
+	tv.SetBool(b)
+	return tv
+}
+
+func typedRune(r rune) TypedValue {
+	tv := TypedValue{T: Int32Type}
+	tv.SetInt32(r)
+	return tv
+}
+
+// NOTE: does not allocate; used for panics.
+func typedString(s string) TypedValue {
+	tv := TypedValue{T: StringType}
+	tv.V = StringValue(s)
+	return tv
+}
+
+// typedRuntimeError creates a Gno value of type .runtimeError that implements
+// the Gno error interface. Used for VM-level runtime panics (nil pointer
+// dereference, etc.) so that recover().(error) works as it does in Go.
+func typedRuntimeError(msg string) TypedValue {
+	return TypedValue{
+		T: gRuntimeErrorType,
+		V: StringValue(msg),
+	}
+}
+
+// returns the same tv instance for convenience.
+func fillValueTV(store Store, tv *TypedValue) *TypedValue {
+	switch cv := tv.V.(type) {
+	case *HeapItemValue:
+		fillValueTV(store, &cv.Value)
+	case RefValue:
+		if cv.PkgPath != "" { // load package
+			tv.V = store.GetPackage(cv.PkgPath, false)
+		} else { // load object
+			obj := store.GetObject(cv.ObjectID)
+			if debugAssert {
+				// Verify hash chain: parent's claimed child hash
+				// must match child's actual stored hash.
+				// Escaped objects carry zero RefValue hash (resolved via IAVL).
+				if childHash := obj.GetHash(); !cv.Hash.IsZero() && cv.Hash != childHash {
+					panic(fmt.Sprintf(
+						"hash chain broken at %s: parent claims child hash %X, but child has %X",
+						cv.ObjectID, cv.Hash.Bytes(), childHash.Bytes(),
+					))
+				}
+			}
+			tv.V = obj
+		}
+	case PointerValue:
+		// As a special case, cv.Base is filled
+		// and cv.TV set appropriately.
+		// XXX but why, isn't lazy better?
+		// Alternatively, could implement
+		// `PointerValue.Deref(store) *TypedValue`,
+		// but for execution speed traded off for
+		// loading speed, we do the following for now:
+		switch cbv := cv.Base.(type) {
+		case *HeapItemValue:
+			fillValueTV(store, &cbv.Value)
+			cv.TV = &cbv.Value
+		case RefValue:
+			base := store.GetObject(cbv.ObjectID).(Value)
+			cv.Base = base
+			switch cbv := base.(type) {
+			case *ArrayValue:
+				et := baseOf(tv.T).(*PointerType).Elt
+				epv := cbv.GetElementPointer(store, cv.Index, et)
+				cv.TV = epv.TV // TODO optimize? (epv.* ignored)
+			case *StructValue:
+				fpv := cbv.GetPointerToInt(store, cv.Index)
+				cv.TV = fpv.TV // TODO optimize?
+			case *BoundMethodValue:
+				panic("should not happen")
+			case *MapValue:
+				panic("should not happen")
+			case *Block:
+				vpv := cbv.GetPointerToInt(store, cv.Index)
+				cv.TV = vpv.TV // TODO optimize?
+			case *HeapItemValue:
+				/* Structs and blocks don't need explicit
+				filling here because GetPointerToInt already
+				does it — it calls fillValueTV on the specific
+				element before returning the pointer.
+				HeapItemValue is the odd one out because it
+				wraps a single value (no index), so there's no
+				GetPointerToInt call — it just takes &cbv.Value
+				directly, skipping the fill step. */
+				fillValueTV(store, &cbv.Value)
+				cv.TV = &cbv.Value
+			default:
+				panic("should not happen")
+			}
+			tv.V = cv
+		}
+	default:
+		// do nothing
+	}
+	return tv
+}
+
+// ----------------------------------------
+// Utility
+func signOfInteger[T interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64
+}](v T) int {
+	if v > 0 {
+		return 1
+	} else if v < 0 {
+		return -1
+	} else {
+		return 0
+	}
+}
+
+func signOfFloat32Bits(u32 uint32) int {
+	sign, mant, exp, _, nan := softfloat.Funpack32(u32)
+	if nan {
+		panic("sign of NaN is undefined")
+	}
+	if exp == 0 && mant == 0 {
+		return 0
+	}
+	if sign != 0 {
+		return -1
+	}
+	return 1
+}
+
+func signOfFloat64Bits(u64 uint64) int {
+	sign, mant, exp, _, nan := softfloat.Funpack64(u64)
+	if nan {
+		panic("sign of NaN is undefined")
+	}
+	if exp == 0 && mant == 0 {
+		return 0
+	}
+	if sign != 0 {
+		return -1
+	}
+	return 1
+}

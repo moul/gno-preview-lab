@@ -1,0 +1,390 @@
+package vm
+
+import (
+	"fmt"
+	"go/token"
+	"strings"
+
+	gno "github.com/gnolang/gno/gnovm/pkg/gnolang"
+	"github.com/gnolang/gno/tm2/pkg/amino"
+	"github.com/gnolang/gno/tm2/pkg/crypto"
+	"github.com/gnolang/gno/tm2/pkg/sdk"
+	"github.com/gnolang/gno/tm2/pkg/std"
+)
+
+//----------------------------------------
+// MsgAddPackage
+
+// MsgAddPackage - create and initialize new package
+type MsgAddPackage struct {
+	Creator    crypto.Address  `json:"creator" yaml:"creator"`
+	Package    *std.MemPackage `json:"package" yaml:"package"`
+	Send       std.Coins       `json:"send" yaml:"send"`
+	MaxDeposit std.Coins       `json:"max_deposit" yaml:"max_deposit"`
+}
+
+var _ std.Msg = MsgAddPackage{}
+
+// NewMsgAddPackage - upload a package with files.
+func NewMsgAddPackage(creator crypto.Address, pkgPath string, files []*std.MemFile) MsgAddPackage {
+	var pkgName string
+	for _, file := range files {
+		if strings.HasSuffix(file.Name, ".gno") {
+			pkgName = string(gno.MustPackageNameFromFileBody(file.Name, file.Body))
+			break
+		}
+	}
+	return MsgAddPackage{
+		Creator: creator,
+		Package: &std.MemPackage{
+			Name:  pkgName,
+			Path:  pkgPath,
+			Files: files,
+		},
+	}
+}
+
+// Implements Msg.
+func (msg MsgAddPackage) Route() string { return RouterKey }
+
+// Implements Msg.
+func (msg MsgAddPackage) Type() string { return "add_package" }
+
+// Implements Msg.
+func (msg MsgAddPackage) ValidateBasic() error {
+	if msg.Creator.IsZero() {
+		return std.ErrInvalidAddress("missing creator address")
+	}
+	if msg.Package.Path == "" { // XXX
+		return ErrInvalidPkgPath("missing package path")
+	}
+	if !msg.Send.IsValid() {
+		return std.ErrInvalidCoins(msg.Send.String())
+	}
+	if !msg.MaxDeposit.IsValid() {
+		return std.ErrInvalidCoins(msg.MaxDeposit.String())
+	}
+	// Validate: ensure the package contains at least one file.
+	if len(msg.Package.Files) == 0 {
+		return ErrInvalidFile("no files in MsgAddPackage")
+	}
+	return nil
+}
+
+// Implements Msg.
+func (msg MsgAddPackage) GetSignBytes() []byte {
+	return std.MustSortJSON(amino.MustMarshalJSON(msg))
+}
+
+// Implements Msg.
+func (msg MsgAddPackage) GetSigners() []crypto.Address {
+	return []crypto.Address{msg.Creator}
+}
+
+// Implements ReceiveMsg.
+func (msg MsgAddPackage) GetReceived() std.Coins {
+	return msg.Send
+}
+
+// SpendForSigner implements std.SpendEstimator. Returns Send when
+// signer is the creator, zero otherwise.
+func (msg MsgAddPackage) SpendForSigner(signer crypto.Address) std.Coins {
+	if signer != msg.Creator {
+		return nil
+	}
+	return msg.Send
+}
+
+//----------------------------------------
+// MsgCall
+
+// MsgCall - executes a Gno statement.
+type MsgCall struct {
+	Caller     crypto.Address `json:"caller" yaml:"caller"`
+	Send       std.Coins      `json:"send" yaml:"send"`
+	MaxDeposit std.Coins      `json:"max_deposit" yaml:"max_deposit"`
+	PkgPath    string         `json:"pkg_path" yaml:"pkg_path"`
+	Func       string         `json:"func" yaml:"func"`
+	Args       []string       `json:"args,omitempty" yaml:"args"`
+}
+
+var _ std.Msg = MsgCall{}
+
+func NewMsgCall(caller crypto.Address, send sdk.Coins, pkgPath, fnc string, args []string) MsgCall {
+	return MsgCall{
+		Caller:  caller,
+		Send:    send,
+		PkgPath: pkgPath,
+		Func:    fnc,
+		Args:    args,
+	}
+}
+
+// Implements Msg.
+func (msg MsgCall) Route() string { return RouterKey }
+
+// Implements Msg.
+func (msg MsgCall) Type() string { return "exec" }
+
+// Implements Msg.
+func (msg MsgCall) ValidateBasic() error {
+	if msg.Caller.IsZero() {
+		return std.ErrInvalidAddress("missing caller address")
+	}
+	if msg.PkgPath == "" {
+		return ErrInvalidPkgPath("missing package path")
+	}
+	if !gno.IsRealmPath(msg.PkgPath) {
+		return ErrInvalidPkgPath("pkgpath must be of a realm")
+	}
+	if _, isInt := gno.IsInternalPath(msg.PkgPath); isInt {
+		return ErrInvalidPkgPath("pkgpath must not be of an internal package")
+	}
+	if msg.Func == "" {
+		return ErrInvalidExpr("missing function to call")
+	}
+	// msg.Func is spliced into `pkg.{Func}(cross, …)` and handed to the
+	// Go parser at Call time; restrict it to a plain identifier so an
+	// attacker can't inject arbitrary Go expression syntax.
+	if !token.IsIdentifier(msg.Func) {
+		return ErrInvalidExpr("func must be a Go identifier")
+	}
+	if !msg.Send.IsValid() {
+		return std.ErrInvalidCoins(msg.Send.String())
+	}
+	if !msg.MaxDeposit.IsValid() {
+		return std.ErrInvalidCoins(msg.MaxDeposit.String())
+	}
+	return nil
+}
+
+// Implements Msg.
+func (msg MsgCall) GetSignBytes() []byte {
+	return std.MustSortJSON(amino.MustMarshalJSON(msg))
+}
+
+// Implements Msg.
+func (msg MsgCall) GetSigners() []crypto.Address {
+	return []crypto.Address{msg.Caller}
+}
+
+// GetPkgPath returns the target package path.
+func (msg MsgCall) GetPkgPath() string { return msg.PkgPath }
+
+// Implements ReceiveMsg.
+func (msg MsgCall) GetReceived() std.Coins {
+	return msg.Send
+}
+
+// SpendForSigner implements std.SpendEstimator. Returns Send when
+// signer is the caller, zero otherwise.
+func (msg MsgCall) SpendForSigner(signer crypto.Address) std.Coins {
+	if signer != msg.Caller {
+		return nil
+	}
+	return msg.Send
+}
+
+//----------------------------------------
+// MsgRun
+
+// MsgRun - executes arbitrary Gno code.
+type MsgRun struct {
+	Caller     crypto.Address  `json:"caller" yaml:"caller"`
+	Send       std.Coins       `json:"send" yaml:"send"`
+	MaxDeposit std.Coins       `json:"max_deposit" yaml:"max_deposit"`
+	Package    *std.MemPackage `json:"package" yaml:"package"`
+}
+
+var _ std.Msg = MsgRun{}
+
+func NewMsgRun(caller crypto.Address, send std.Coins, files []*std.MemFile) MsgRun {
+	for _, file := range files {
+		if strings.HasSuffix(file.Name, ".gno") {
+			pkgName := string(gno.MustPackageNameFromFileBody(file.Name, file.Body))
+			if pkgName != "main" {
+				panic("package name should be 'main'")
+			}
+		}
+	}
+	return MsgRun{
+		Caller: caller,
+		Send:   send,
+		Package: &std.MemPackage{
+			Name:  "main",
+			Path:  "", // auto-set by handler to fmt.Sprintf("gno.land/e/%v/run", caller.String()),
+			Files: files,
+		},
+	}
+}
+
+// Implements Msg.
+func (msg MsgRun) Route() string { return RouterKey }
+
+// Implements Msg.
+func (msg MsgRun) Type() string { return "run" }
+
+// Implements Msg.
+func (msg MsgRun) ValidateBasic() error {
+	if msg.Caller.IsZero() {
+		return std.ErrInvalidAddress("missing caller address")
+	}
+
+	if msg.Package.Path != "" {
+		// Force memPkg path to the reserved run path.
+		expected := "gno.land/e/" + msg.Caller.String() + "/run"
+		if path := msg.Package.Path; path != expected {
+			return ErrInvalidPkgPath(fmt.Sprintf("invalid pkgpath for MsgRun: %q", path))
+		}
+	}
+	// Validate: ensure the package contains at least one file.
+	if len(msg.Package.Files) == 0 {
+		return ErrInvalidFile("no files in MsgRun")
+	}
+
+	if !msg.Send.IsValid() {
+		return std.ErrInvalidCoins(msg.Send.String())
+	}
+	if !msg.MaxDeposit.IsValid() {
+		return std.ErrInvalidCoins(msg.MaxDeposit.String())
+	}
+	return nil
+}
+
+// Implements Msg.
+func (msg MsgRun) GetSignBytes() []byte {
+	return std.MustSortJSON(amino.MustMarshalJSON(msg))
+}
+
+// Implements Msg.
+func (msg MsgRun) GetSigners() []crypto.Address {
+	return []crypto.Address{msg.Caller}
+}
+
+// Implements ReceiveMsg.
+func (msg MsgRun) GetReceived() std.Coins {
+	return msg.Send
+}
+
+// SpendForSigner implements std.SpendEstimator. Returns Send when
+// signer is the caller, zero otherwise.
+func (msg MsgRun) SpendForSigner(signer crypto.Address) std.Coins {
+	if signer != msg.Caller {
+		return nil
+	}
+	return msg.Send
+}
+
+//----------------------------------------
+// MsgEnablePackage
+
+// MsgEnablePackage activates an inert package: runs typecheck and init,
+// then makes the package importable on-chain.
+// Only addresses listed in Params.PkgApprovers may send this message.
+type MsgEnablePackage struct {
+	Approver crypto.Address `json:"approver" yaml:"approver"`
+	PkgPath  string         `json:"pkg_path" yaml:"pkg_path"`
+	// PkgHash names the source being approved, as PackageContentHash computes
+	// it. Approval otherwise names only a path, and the creator may replace
+	// what is parked there before the enable lands.
+	//
+	// Appended last: amino field numbers are positional, so inserting it
+	// anywhere else would renumber the fields above and change how every
+	// existing transaction decodes.
+	PkgHash string `json:"pkg_hash" yaml:"pkg_hash"`
+	// PkgHeight pins the SUBMISSION being approved, as AddPkg.Height recorded
+	// it at submit.
+	//
+	// PkgHash covers what the author's directory declares. It cannot cover the
+	// [addpkg] section, because the approver's local copy does not have one --
+	// the keeper writes it. So a creator can re-park byte-identical sources and
+	// keep the hash while changing creator, height and max_deposit. Lowering
+	// max_deposit under a standing approval is the sharp end: the enable passes
+	// the hash gate, runs init(), and only then aborts on the deposit, so the
+	// approver pays gas for a transaction that could never have succeeded, and
+	// the creator can repeat it for the price of a submission.
+	//
+	// Pinning the height closes the whole class rather than one field at a
+	// time: every re-park lands at a new height, so any of them invalidates the
+	// approval, including a creator swap after a MsgRejectPackage.
+	//
+	// Zero means unpinned. That is what every transaction predating this field
+	// decodes as, and what genesis replay carries, so it cannot be required
+	// here -- see the replay exemptions in EnablePackage.
+	//
+	// Appended last, for the reason above.
+	PkgHeight int64 `json:"pkg_height" yaml:"pkg_height"`
+}
+
+var _ std.Msg = MsgEnablePackage{}
+
+func (msg MsgEnablePackage) Route() string { return RouterKey }
+func (msg MsgEnablePackage) Type() string  { return "enable_package" }
+
+func (msg MsgEnablePackage) ValidateBasic() error {
+	if msg.Approver.IsZero() {
+		return std.ErrInvalidAddress("missing approver address")
+	}
+	if msg.PkgPath == "" {
+		return ErrInvalidPkgPath("missing package path")
+	}
+	return nil
+}
+
+func (msg MsgEnablePackage) GetSignBytes() []byte {
+	return std.MustSortJSON(amino.MustMarshalJSON(msg))
+}
+
+func (msg MsgEnablePackage) GetSigners() []crypto.Address {
+	return []crypto.Address{msg.Approver}
+}
+
+func (msg MsgEnablePackage) GetReceived() std.Coins { return nil }
+
+func (msg MsgEnablePackage) SpendForSigner(_ crypto.Address) std.Coins { return nil }
+
+//----------------------------------------
+// MsgRejectPackage
+
+// MsgRejectPackage removes a package that is parked awaiting approval.
+//
+// Two parties may send it, and for different reasons: an approver declining a
+// submission, and the creator withdrawing its own. One message rather than two
+// because the effect is identical -- the parked blob is deleted and nothing
+// else happens.
+//
+// The submission charge is NOT refunded. It priced the work of parking the
+// bytes, which happened; refunding it would also make rejection a way to
+// recover the charge, and the charge is what makes bulk submission cost
+// something.
+type MsgRejectPackage struct {
+	Sender  crypto.Address `json:"sender" yaml:"sender"`
+	PkgPath string         `json:"pkg_path" yaml:"pkg_path"`
+}
+
+var _ std.Msg = MsgRejectPackage{}
+
+func (msg MsgRejectPackage) Route() string { return RouterKey }
+func (msg MsgRejectPackage) Type() string  { return "reject_package" }
+
+func (msg MsgRejectPackage) ValidateBasic() error {
+	if msg.Sender.IsZero() {
+		return std.ErrInvalidAddress("missing sender address")
+	}
+	if msg.PkgPath == "" {
+		return ErrInvalidPkgPath("missing package path")
+	}
+	return nil
+}
+
+func (msg MsgRejectPackage) GetSignBytes() []byte {
+	return std.MustSortJSON(amino.MustMarshalJSON(msg))
+}
+
+func (msg MsgRejectPackage) GetSigners() []crypto.Address {
+	return []crypto.Address{msg.Sender}
+}
+
+func (msg MsgRejectPackage) GetReceived() std.Coins { return nil }
+
+func (msg MsgRejectPackage) SpendForSigner(_ crypto.Address) std.Coins { return nil }

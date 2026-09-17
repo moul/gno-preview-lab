@@ -1,0 +1,666 @@
+package amino
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math"
+	"math/bits"
+	"time"
+)
+
+// ----------------------------------------
+// Signed
+
+func EncodeVarint8(w io.Writer, i int8) (err error) {
+	var buf [2]byte
+	n := binary.PutVarint(buf[:], int64(i))
+	_, err = w.Write(buf[0:n])
+	return
+}
+
+func EncodeVarint16(w io.Writer, i int16) (err error) {
+	var buf [3]byte
+	n := binary.PutVarint(buf[:], int64(i))
+	_, err = w.Write(buf[0:n])
+	return
+}
+
+func EncodeVarint32(w io.Writer, i int32) (err error) {
+	var buf [5]byte
+	n := binary.PutVarint(buf[:], int64(i))
+	_, err = w.Write(buf[0:n])
+	return
+}
+
+func EncodeVarint(w io.Writer, i int64) (err error) {
+	var buf [10]byte
+	n := binary.PutVarint(buf[:], i)
+	_, err = w.Write(buf[0:n])
+	return
+}
+
+// EncodePlainVarint encodes i as a plain protobuf varint (proto wire-type 0,
+// proto schema int64). Negative values consume 10 bytes; non-negative values
+// use the standard varint length. Use this only when wire-byte compatibility
+// with upstream protobuf int64 is required (e.g., Tendermint privval canonical
+// types). For ordinary signed-int encoding prefer EncodeVarint (zigzag,
+// proto sint64).
+func EncodePlainVarint(w io.Writer, i int64) (err error) {
+	return EncodeUvarint(w, uint64(i))
+}
+
+// EncodePlainVarint32 encodes i as a plain protobuf varint (proto int32).
+// Sign-extends int32 to int64 before varint encoding, matching upstream
+// protobuf's int32 wire format.
+func EncodePlainVarint32(w io.Writer, i int32) (err error) {
+	return EncodeUvarint(w, uint64(int64(i)))
+}
+
+func EncodeInt32(w io.Writer, i int32) (err error) {
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], uint32(i))
+	_, err = w.Write(buf[:])
+	return
+}
+
+func EncodeInt64(w io.Writer, i int64) (err error) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], uint64(i))
+	_, err = w.Write(buf[:])
+	return err
+}
+
+func VarintSize(i int64) int {
+	return UvarintSize((uint64(i) << 1) ^ uint64(i>>63))
+}
+
+// PlainVarintSize returns the number of bytes EncodePlainVarint would emit for i.
+func PlainVarintSize(i int64) int {
+	return UvarintSize(uint64(i))
+}
+
+// ----------------------------------------
+// Unsigned
+
+// Unlike EncodeUint8, writes a single byte.
+func EncodeByte(w io.Writer, b byte) (err error) {
+	_, err = w.Write([]byte{b})
+	return
+}
+
+func EncodeUvarint8(w io.Writer, i uint8) (err error) {
+	var buf [2]byte
+	n := binary.PutUvarint(buf[:], uint64(i))
+	_, err = w.Write(buf[0:n])
+	return
+}
+
+func EncodeUvarint16(w io.Writer, i uint16) (err error) {
+	var buf [3]byte
+	n := binary.PutUvarint(buf[:], uint64(i))
+	_, err = w.Write(buf[0:n])
+	return
+}
+
+func EncodeUvarint32(w io.Writer, i uint32) (err error) {
+	var buf [5]byte
+	n := binary.PutUvarint(buf[:], uint64(i))
+	_, err = w.Write(buf[0:n])
+	return
+}
+
+func EncodeUvarint(w io.Writer, u uint64) (err error) {
+	var buf [10]byte
+	n := binary.PutUvarint(buf[:], u)
+	_, err = w.Write(buf[0:n])
+	return
+}
+
+func EncodeUint32(w io.Writer, u uint32) (err error) {
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], u)
+	_, err = w.Write(buf[:])
+	return
+}
+
+func EncodeUint64(w io.Writer, u uint64) (err error) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], u)
+	_, err = w.Write(buf[:])
+	return
+}
+
+func UvarintSize(u uint64) int {
+	if u == 0 {
+		return 1
+	}
+	return (bits.Len64(u) + 6) / 7
+}
+
+// ----------------------------------------
+// Other Primitives
+
+func EncodeBool(w io.Writer, b bool) (err error) {
+	if b {
+		err = EncodeByte(w, 0x01)
+	} else {
+		err = EncodeByte(w, 0x00)
+	}
+	return
+}
+
+// NOTE: UNSAFE
+func EncodeFloat32(w io.Writer, f float32) (err error) {
+	return EncodeUint32(w, math.Float32bits(f))
+}
+
+// NOTE: UNSAFE
+func EncodeFloat64(w io.Writer, f float64) (err error) {
+	return EncodeUint64(w, math.Float64bits(f))
+}
+
+// ----------------------------------------
+// Time and Duration
+
+const (
+	// See https://github.com/protocolbuffers/protobuf/blob/d2980062c859649523d5fd51d6b55ab310e47482/src/google/protobuf/timestamp.proto#L123-L135
+	// seconds of 01-01-0001
+	minTimeSeconds int64 = -62135596800
+	// seconds of 10000-01-01
+	maxTimeSeconds int64 = 253402300800 // exclusive
+	// nanos have to be in interval: [0, 999999999]
+	maxTimeNanos = 999999999 // inclusive
+
+	// See https://github.com/protocolbuffers/protobuf/blob/d2980062c859649523d5fd51d6b55ab310e47482/src/google/protobuf/duration.proto#L105-L116
+	minDurationSeconds int64 = -315576000000
+	maxDurationSeconds int64 = 315576000000 // inclusive
+	minDurationNanos         = -999999999
+	maxDurationNanos         = 999999999 // inclusive
+)
+
+type InvalidTimeError string
+
+func (e InvalidTimeError) Error() string {
+	return "invalid time: " + string(e)
+}
+
+type InvalidDurationError string
+
+func (e InvalidDurationError) Error() string {
+	return "invalid duration: " + string(e)
+}
+
+// EncodeTimeValue writes the number of seconds (int64) and nanoseconds (int32),
+// with millisecond resolution since January 1, 1970 UTC to the Writer as an
+// UInt64.
+// Milliseconds are used to ease compatibility with Javascript,
+// which does not support finer resolution.
+/* See https://godoc.org/google.golang.org/protobuf/types/known/timestamppb#Timestamp
+type Timestamp struct {
+
+    // Represents seconds of UTC time since Unix epoch
+    // 1970-01-01T00:00:00Z. Must be from 0001-01-01T00:00:00Z to
+    // 9999-12-31T23:59:59Z inclusive.
+    Seconds int64 `protobuf:"varint,1,opt,name=seconds,proto3" json:"seconds,omitempty"`
+    // Non-negative fractions of a second at nanosecond resolution. Negative
+    // second values with fractions must still have non-negative nanos values
+    // that count forward in time. Must be from 0 to 999,999,999
+    // inclusive.
+    Nanos int32 `protobuf:"varint,2,opt,name=nanos,proto3" json:"nanos,omitempty"`
+    // contains filtered or unexported fields
+}
+*/
+func EncodeTimeValue(w io.Writer, s int64, ns int32) (err error) {
+	// Validations
+	err = validateTimeValue(s, ns)
+	if err != nil {
+		return
+	}
+	// skip if default/zero value:
+	if s != 0 {
+		err = encodeFieldNumberAndTyp3(w, 1, Typ3Varint)
+		if err != nil {
+			return
+		}
+		err = EncodeUvarint(w, uint64(s))
+		if err != nil {
+			return
+		}
+	}
+	// skip if default/zero value:
+	if ns != 0 {
+		err = encodeFieldNumberAndTyp3(w, 2, Typ3Varint)
+		if err != nil {
+			return
+		}
+		err = EncodeUvarint(w, uint64(ns))
+		if err != nil {
+			return
+		}
+	}
+
+	return err
+}
+
+func EncodeTime(w io.Writer, t time.Time) (err error) {
+	return EncodeTimeValue(w, t.Unix(), int32(t.Nanosecond()))
+}
+
+func validateTimeValue(s int64, ns int32) (err error) {
+	if s < minTimeSeconds || s >= maxTimeSeconds {
+		return InvalidTimeError(fmt.Sprintf("seconds have to be >= %d and < %d, got: %d",
+			minTimeSeconds, maxTimeSeconds, s))
+	}
+	if ns < 0 || ns > maxTimeNanos {
+		// we could as well panic here:
+		// time.Time.Nanosecond() guarantees nanos to be in [0, 999,999,999]
+		return InvalidTimeError(fmt.Sprintf("nanoseconds have to be >= 0 and <= %v, got: %d",
+			maxTimeNanos, ns))
+	}
+	return nil
+}
+
+// The binary encoding of Duration is the same as Timestamp,
+// but the validation checks are different.
+/* See https://godoc.org/google.golang.org/protobuf/types/known/durationpb#Duration
+type Duration struct {
+
+    // Signed seconds of the span of time. Must be from -315,576,000,000
+    // to +315,576,000,000 inclusive. Note: these bounds are computed from:
+    // 60 sec/min * 60 min/hr * 24 hr/day * 365.25 days/year * 10000 years
+    Seconds int64 `protobuf:"varint,1,opt,name=seconds,proto3" json:"seconds,omitempty"`
+    // Signed fractions of a second at nanosecond resolution of the span
+    // of time. Durations less than one second are represented with a 0
+    // `seconds` field and a positive or negative `nanos` field. For durations
+    // of one second or more, a non-zero value for the `nanos` field must be
+    // of the same sign as the `seconds` field. Must be from -999,999,999
+    // to +999,999,999 inclusive.
+    Nanos int32 `protobuf:"varint,2,opt,name=nanos,proto3" json:"nanos,omitempty"`
+    // contains filtered or unexported fields
+}
+*/
+func EncodeDurationValue(w io.Writer, s int64, ns int32) (err error) {
+	// Validations
+	err = validateDurationValue(s, ns)
+	if err != nil {
+		return err
+	}
+	// skip if default/zero value:
+	if s != 0 {
+		err = encodeFieldNumberAndTyp3(w, 1, Typ3Varint)
+		if err != nil {
+			return
+		}
+		err = EncodeUvarint(w, uint64(s))
+		if err != nil {
+			return
+		}
+	}
+	// skip if default/zero value:
+	if ns != 0 {
+		err = encodeFieldNumberAndTyp3(w, 2, Typ3Varint)
+		if err != nil {
+			return
+		}
+		err = EncodeUvarint(w, uint64(ns))
+		if err != nil {
+			return
+		}
+	}
+
+	return err
+}
+
+func EncodeDuration(w io.Writer, d time.Duration) (err error) {
+	sns := d.Nanoseconds()
+	s, ns := sns/1e9, int32(sns%1e9)
+	err = validateDurationValue(s, ns)
+	if err != nil {
+		return err
+	}
+	return EncodeDurationValue(w, s, ns)
+}
+
+func validateDurationValue(s int64, ns int32) (err error) {
+	if (s > 0 && ns < 0) || (s < 0 && ns > 0) {
+		return InvalidDurationError(fmt.Sprintf("signs of seconds and nanos do not match: %v and %v",
+			s, ns))
+	}
+	if s < minDurationSeconds || s > maxDurationSeconds {
+		return InvalidDurationError(fmt.Sprintf("seconds have to be >= %d and < %d, got: %d",
+			minDurationSeconds, maxDurationSeconds, s))
+	}
+	if ns < minDurationNanos || ns > maxDurationNanos {
+		return InvalidDurationError(fmt.Sprintf("ns out of range [%v, %v], got: %v",
+			minDurationNanos, maxDurationNanos, ns))
+	}
+	return nil
+}
+
+const (
+	// On the other hand, Go's native duration only allows a smaller interval:
+	// https://golang.org/pkg/time/#Duration
+	minDurationSecondsGo = int64(math.MinInt64) / int64(1e9)
+	maxDurationSecondsGo = int64(math.MaxInt64) / int64(1e9)
+)
+
+// Go's time.Duration has a more limited range.
+// This is specific to Go and not Amino.
+func validateDurationValueGo(s int64, ns int32) (err error) {
+	err = validateDurationValue(s, ns)
+	if err != nil {
+		return err
+	}
+	if s < minDurationSecondsGo || s > maxDurationSecondsGo {
+		return InvalidDurationError(fmt.Sprintf("duration seconds exceeds bounds for Go's time.Duration type: %v",
+			s))
+	}
+	sns := s*1e9 + int64(ns)
+	if sns > 0 && s < 0 || sns < 0 && s > 0 {
+		return InvalidDurationError(fmt.Sprintf("duration seconds+nanoseconds exceeds bounds for Go's time.Duration type: %v and %v",
+			s, ns))
+	}
+	return nil
+}
+
+// ----------------------------------------
+// Byte Slices and Strings
+
+func EncodeByteSlice(w io.Writer, bz []byte) (err error) {
+	err = EncodeUvarint(w, uint64(len(bz)))
+	if err != nil {
+		return
+	}
+	_, err = w.Write(bz)
+	return
+}
+
+func ByteSliceSize(bz []byte) int {
+	return UvarintSize(uint64(len(bz))) + len(bz)
+}
+
+func EncodeString(w io.Writer, s string) (err error) {
+	return EncodeByteSlice(w, []byte(s))
+}
+
+// ----------------------------------------
+// Prepend* functions for backward-writing encoding.
+// These write encoded bytes at buf[offset-n:offset] and return the new offset.
+
+func PrependByte(buf []byte, offset int, b byte) int {
+	offset--
+	buf[offset] = b
+	return offset
+}
+
+func PrependBool(buf []byte, offset int, b bool) int {
+	if b {
+		return PrependByte(buf, offset, 0x01)
+	}
+	return PrependByte(buf, offset, 0x00)
+}
+
+func PrependVarint(buf []byte, offset int, i int64) int {
+	var tmp [10]byte
+	n := binary.PutVarint(tmp[:], i)
+	offset -= n
+	copy(buf[offset:], tmp[:n])
+	return offset
+}
+
+// PrependPlainVarint is the codegen-side counterpart to EncodePlainVarint:
+// emits i as plain varint (proto int64) at the given offset.
+func PrependPlainVarint(buf []byte, offset int, i int64) int {
+	return PrependUvarint(buf, offset, uint64(i))
+}
+
+func PrependUvarint(buf []byte, offset int, u uint64) int {
+	var tmp [10]byte
+	n := binary.PutUvarint(tmp[:], u)
+	offset -= n
+	copy(buf[offset:], tmp[:n])
+	return offset
+}
+
+func PrependInt32(buf []byte, offset int, i int32) int {
+	offset -= 4
+	binary.LittleEndian.PutUint32(buf[offset:], uint32(i))
+	return offset
+}
+
+func PrependInt64(buf []byte, offset int, i int64) int {
+	offset -= 8
+	binary.LittleEndian.PutUint64(buf[offset:], uint64(i))
+	return offset
+}
+
+func PrependUint32(buf []byte, offset int, u uint32) int {
+	offset -= 4
+	binary.LittleEndian.PutUint32(buf[offset:], u)
+	return offset
+}
+
+func PrependUint64(buf []byte, offset int, u uint64) int {
+	offset -= 8
+	binary.LittleEndian.PutUint64(buf[offset:], u)
+	return offset
+}
+
+func PrependFloat32(buf []byte, offset int, f float32) int {
+	return PrependUint32(buf, offset, math.Float32bits(f))
+}
+
+func PrependFloat64(buf []byte, offset int, f float64) int {
+	return PrependUint64(buf, offset, math.Float64bits(f))
+}
+
+func PrependBytes(buf []byte, offset int, bz []byte) int {
+	offset -= len(bz)
+	copy(buf[offset:], bz)
+	return offset
+}
+
+func PrependByteSlice(buf []byte, offset int, bz []byte) int {
+	offset = PrependBytes(buf, offset, bz)
+	offset = PrependUvarint(buf, offset, uint64(len(bz)))
+	return offset
+}
+
+func PrependString(buf []byte, offset int, s string) int {
+	offset -= len(s)
+	copy(buf[offset:], s)
+	offset = PrependUvarint(buf, offset, uint64(len(s)))
+	return offset
+}
+
+func PrependFieldNumberAndTyp3(buf []byte, offset int, num uint32, typ Typ3) int {
+	value64 := (uint64(num) << 3) | uint64(typ)
+	return PrependUvarint(buf, offset, value64)
+}
+
+// PrependTimeValue writes Timestamp proto fields backward into buf.
+func PrependTimeValue(buf []byte, offset int, s int64, ns int32) (int, error) {
+	if err := validateTimeValue(s, ns); err != nil {
+		return offset, err
+	}
+	// Write fields backward: field 2 (nanos) first, then field 1 (seconds).
+	if ns != 0 {
+		offset = PrependUvarint(buf, offset, uint64(ns))
+		offset = PrependFieldNumberAndTyp3(buf, offset, 2, Typ3Varint)
+	}
+	if s != 0 {
+		offset = PrependUvarint(buf, offset, uint64(s))
+		offset = PrependFieldNumberAndTyp3(buf, offset, 1, Typ3Varint)
+	}
+	return offset, nil
+}
+
+func PrependTime(buf []byte, offset int, t time.Time) (int, error) {
+	return PrependTimeValue(buf, offset, t.Unix(), int32(t.Nanosecond()))
+}
+
+func PrependDurationValue(buf []byte, offset int, s int64, ns int32) (int, error) {
+	if err := validateDurationValue(s, ns); err != nil {
+		return offset, err
+	}
+	if ns != 0 {
+		offset = PrependUvarint(buf, offset, uint64(ns))
+		offset = PrependFieldNumberAndTyp3(buf, offset, 2, Typ3Varint)
+	}
+	if s != 0 {
+		offset = PrependUvarint(buf, offset, uint64(s))
+		offset = PrependFieldNumberAndTyp3(buf, offset, 1, Typ3Varint)
+	}
+	return offset, nil
+}
+
+func PrependDuration(buf []byte, offset int, d time.Duration) (int, error) {
+	sns := d.Nanoseconds()
+	s, ns := sns/1e9, int32(sns%1e9)
+	return PrependDurationValue(buf, offset, s, ns)
+}
+
+// ----------------------------------------
+// Append*Reversed functions for reversed-append encoding.
+// These append bytes in reversed order to buf and return the updated slice.
+// A single reverseBytes() at the end produces correct protobuf wire format.
+// Uses the standard Go append pattern: buf = AppendXReversed(buf, ...).
+
+func reverseBytes(buf []byte) {
+	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
+		buf[i], buf[j] = buf[j], buf[i]
+	}
+}
+
+func AppendByteReversed(buf []byte, b byte) []byte {
+	return append(buf, b)
+}
+
+func AppendBoolReversed(buf []byte, b bool) []byte {
+	if b {
+		return append(buf, 0x01)
+	}
+	return append(buf, 0x00)
+}
+
+func AppendVarintReversed(buf []byte, i int64) []byte {
+	var tmp [10]byte
+	n := binary.PutVarint(tmp[:], i)
+	for j := n - 1; j >= 0; j-- {
+		buf = append(buf, tmp[j])
+	}
+	return buf
+}
+
+// AppendPlainVarintReversed is the reversed-emit counterpart to
+// AppendVarintReversed for plain varint (proto int64) encoding.
+func AppendPlainVarintReversed(buf []byte, i int64) []byte {
+	return AppendUvarintReversed(buf, uint64(i))
+}
+
+func AppendUvarintReversed(buf []byte, u uint64) []byte {
+	var tmp [10]byte
+	n := binary.PutUvarint(tmp[:], u)
+	for j := n - 1; j >= 0; j-- {
+		buf = append(buf, tmp[j])
+	}
+	return buf
+}
+
+func AppendInt32Reversed(buf []byte, i int32) []byte {
+	var tmp [4]byte
+	binary.LittleEndian.PutUint32(tmp[:], uint32(i))
+	return append(buf, tmp[3], tmp[2], tmp[1], tmp[0])
+}
+
+func AppendInt64Reversed(buf []byte, i int64) []byte {
+	var tmp [8]byte
+	binary.LittleEndian.PutUint64(tmp[:], uint64(i))
+	return append(buf, tmp[7], tmp[6], tmp[5], tmp[4], tmp[3], tmp[2], tmp[1], tmp[0])
+}
+
+func AppendUint32Reversed(buf []byte, u uint32) []byte {
+	var tmp [4]byte
+	binary.LittleEndian.PutUint32(tmp[:], u)
+	return append(buf, tmp[3], tmp[2], tmp[1], tmp[0])
+}
+
+func AppendUint64Reversed(buf []byte, u uint64) []byte {
+	var tmp [8]byte
+	binary.LittleEndian.PutUint64(tmp[:], u)
+	return append(buf, tmp[7], tmp[6], tmp[5], tmp[4], tmp[3], tmp[2], tmp[1], tmp[0])
+}
+
+func AppendFloat32Reversed(buf []byte, f float32) []byte {
+	return AppendUint32Reversed(buf, math.Float32bits(f))
+}
+
+func AppendFloat64Reversed(buf []byte, f float64) []byte {
+	return AppendUint64Reversed(buf, math.Float64bits(f))
+}
+
+func AppendBytesReversed(buf []byte, bz []byte) []byte {
+	start := len(buf)
+	buf = append(buf, bz...)
+	reverseBytes(buf[start:])
+	return buf
+}
+
+func AppendByteSliceReversed(buf []byte, bz []byte) []byte {
+	buf = AppendBytesReversed(buf, bz)
+	buf = AppendUvarintReversed(buf, uint64(len(bz)))
+	return buf
+}
+
+func AppendStringReversed(buf []byte, s string) []byte {
+	start := len(buf)
+	buf = append(buf, s...)
+	reverseBytes(buf[start:])
+	buf = AppendUvarintReversed(buf, uint64(len(s)))
+	return buf
+}
+
+func AppendFieldNumberAndTyp3Reversed(buf []byte, num uint32, typ Typ3) []byte {
+	return AppendUvarintReversed(buf, (uint64(num)<<3)|uint64(typ))
+}
+
+func AppendTimeValueReversed(buf []byte, s int64, ns int32) ([]byte, error) {
+	if err := validateTimeValue(s, ns); err != nil {
+		return buf, err
+	}
+	if ns != 0 {
+		buf = AppendUvarintReversed(buf, uint64(ns))
+		buf = AppendFieldNumberAndTyp3Reversed(buf, 2, Typ3Varint)
+	}
+	if s != 0 {
+		buf = AppendUvarintReversed(buf, uint64(s))
+		buf = AppendFieldNumberAndTyp3Reversed(buf, 1, Typ3Varint)
+	}
+	return buf, nil
+}
+
+func AppendTimeReversed(buf []byte, t time.Time) ([]byte, error) {
+	return AppendTimeValueReversed(buf, t.Unix(), int32(t.Nanosecond()))
+}
+
+func AppendDurationValueReversed(buf []byte, s int64, ns int32) ([]byte, error) {
+	if err := validateDurationValue(s, ns); err != nil {
+		return buf, err
+	}
+	if ns != 0 {
+		buf = AppendUvarintReversed(buf, uint64(ns))
+		buf = AppendFieldNumberAndTyp3Reversed(buf, 2, Typ3Varint)
+	}
+	if s != 0 {
+		buf = AppendUvarintReversed(buf, uint64(s))
+		buf = AppendFieldNumberAndTyp3Reversed(buf, 1, Typ3Varint)
+	}
+	return buf, nil
+}
+
+func AppendDurationReversed(buf []byte, d time.Duration) ([]byte, error) {
+	sns := d.Nanoseconds()
+	s, ns := sns/1e9, int32(sns%1e9)
+	return AppendDurationValueReversed(buf, s, ns)
+}

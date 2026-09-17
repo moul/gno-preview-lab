@@ -1,0 +1,50 @@
+# Load the packages and start the node
+loadpkg gno.land/p/testing/pure_package $WORK/pure_package
+loadpkg gno.land/r/testing/realm_caller $WORK/realm_caller
+
+gnoland start
+
+# /p/-globals are immutable post-init: attempts to mutate a /p/-stamped
+# real object via the receiver-borrow path (here: realm_caller.Set →
+# pkg.Fo.Set) now panic at DidUpdate. Stdlib stays exempt; /r/-stored
+# receivers using /p/-helper methods (list.Set, avl.Tree.Set, etc.) are
+# unaffected because the receiver's PkgID is /r/, not /p/.
+! gnokey maketx call -pkgpath gno.land/r/testing/realm_caller -func Set -args 42 -gas-fee 230001ugnot -gas-wanted 2_300_000 -chainid=tendermint_test test1
+stderr 'cannot mutate gno.land/p/testing/pure_package: package is immutable post-init'
+
+# Get still works (read path); /p/-state remains at its init value.
+gnokey query vm/qeval --data "gno.land/r/testing/realm_caller.Get()"
+stdout '0 int'
+
+-- pure_package/pure_package.gno --
+package pure_package
+
+var Fo = &FooObject{value: 0}
+
+type FooObject struct {
+	value int
+}
+
+func (fo *FooObject) Set(value int) {
+	fo.value = value
+}
+
+func (fo *FooObject) Get() int {
+	return fo.value
+}
+
+
+-- realm_caller/realm_caller.gno --
+package realm_caller
+
+import (
+	pkg "gno.land/p/testing/pure_package"
+)
+
+func Set(cur realm, value int) {
+	pkg.Fo.Set(value)
+}
+
+func Get() int {
+	return pkg.Fo.Get()
+}

@@ -1,0 +1,111 @@
+# generate Go docs and publish on gh-pages branch
+# Live at: https://gnolang.github.io/gno
+name: deploy / pages
+
+on:
+  # No path filter on push: this is what actually publishes gh-pages.
+  push:
+    branches:
+      - master
+  # On pull requests the `deploy` job and the artifact upload are skipped
+  # (see the `if:` conditions below), so `build` only proves the generators
+  # still work. Restrict it to what they read.
+  pull_request:
+    branches:
+      - master
+    paths:
+      - .github/workflows/deploy-pages.yml
+      - misc/gendocs/**
+      - misc/stdlib_diff/**
+      - gnovm/stdlibs/**
+      - '**/*.go'
+      - go.mod
+      - go.sum
+  # Dispatched by pr-preview-publish.yml / pr-preview-cleanup.yml after they
+  # change a pr-<N>/ directory on the gh-pages storage branch: every run
+  # publishes the whole site, so a preview change needs a redeploy.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  # Every run rebuilds and publishes the complete site, so a newer run is always
+  # a superset of the one it replaces. Cancelling in progress is what keeps a
+  # burst of pull request previews from queueing up one full deploy each.
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Alternatively, validate based on provided tokens and permissions.
+    # GNOWEB_PREVIEW_BASE_URL also opts a fork in: a repository that publishes
+    # pull request previews has to publish the Pages site that carries them.
+    if: github.repository == 'gnolang/gno' || vars.GNOWEB_PREVIEW_BASE_URL != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      # Use the goroot at the top of the project to compare with the GnoVM
+      # stdlib, rather than the one in stdlib_diff (which may have a go.mod with
+      # a different toolchain version).
+      - run: echo "GOROOT_SAVE=$(go env GOROOT)" >> "$GITHUB_ENV"
+      - run: "cd misc/stdlib_diff && make gen"
+      - run: "cd misc/gendocs && make install gen"
+      - run: "mkdir -p pages_output/stdlib_diff"
+      - run: |
+          cp -r misc/gendocs/godoc/* pages_output/
+          cp -r misc/stdlib_diff/stdlib_diff/* pages_output/stdlib_diff/
+
+      # Per-pull-request gnoweb previews live on the gh-pages branch, which is
+      # storage rather than a publishing source: pr-preview-publish.yml writes
+      # pr-<N>/ there and dispatches this workflow. Folding them in here keeps
+      # Pages on a custom Actions workflow, which is exempt from the 10
+      # builds/hour cap that branch-published sites are subject to.
+      - name: Fold in the pull request previews
+        if: github.event_name != 'pull_request'
+        run: |
+          git fetch origin gh-pages --depth=1 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
+            git worktree add .ghp origin/gh-pages
+            for d in .ghp/pr-*/; do
+              [ -d "$d" ] || continue
+              cp -r "$d" "pages_output/$(basename "$d")"
+            done
+            git worktree remove --force .ghp
+          fi
+          # The previews serve pages from _t/ and _a/ directories, which Jekyll
+          # would drop.
+          : > pages_output/.nojekyll
+          du -sh pages_output
+
+      # These two last steps will be skipped on pull requests
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+        id: pages
+        if: github.event_name != 'pull_request'
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: github.event_name != 'pull_request'
+        with:
+          path: ./pages_output
+
+  deploy:
+    if: >
+      (github.repository == 'gnolang/gno' || vars.GNOWEB_PREVIEW_BASE_URL != '') &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write # to deploy to GitHub Pages
+      id-token: write # for OIDC token used by actions/deploy-pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    needs: build
+    steps:
+      - uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+        id: deployment

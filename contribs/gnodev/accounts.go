@@ -1,0 +1,156 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"strings"
+	"text/tabwriter"
+
+	"github.com/gnolang/gno/contribs/gnodev/pkg/address"
+	"github.com/gnolang/gno/contribs/gnodev/pkg/dev"
+	"github.com/gnolang/gno/gno.land/pkg/gnoland"
+	"github.com/gnolang/gno/gno.land/pkg/gnoland/ugnot"
+	"github.com/gnolang/gno/tm2/pkg/amino"
+	"github.com/gnolang/gno/tm2/pkg/bft/rpc/client"
+	"github.com/gnolang/gno/tm2/pkg/std"
+)
+
+type varPremineAccounts map[string]std.Coins // name or bech32 to coins.
+
+func (va *varPremineAccounts) Set(value string) error {
+	if *va == nil {
+		*va = map[string]std.Coins{}
+	}
+	accounts := *va
+
+	user, amount, found := strings.Cut(value, "=")
+	accounts[user] = nil
+	if !found {
+		return nil
+	}
+
+	coins, err := std.ParseCoins(amount)
+	if err != nil {
+		return fmt.Errorf("unable to parse coins from %q: %w", user, err)
+	}
+
+	// Add the parsed amount to the user.
+	accounts[user] = coins
+	return nil
+}
+
+func (va varPremineAccounts) String() string {
+	accs := make([]string, 0, len(va))
+	for user, balance := range va {
+		accs = append(accs, fmt.Sprintf("%s(%s)", user, balance.String()))
+	}
+
+	return strings.Join(accs, ",")
+}
+
+func generateBalances(bk *address.Book, cfg *AppConfig) (gnoland.Balances, error) {
+	bls := gnoland.NewBalances()
+	premineBalance := std.Coins{std.NewCoin(ugnot.Denom, 10e12)}
+
+	entries := bk.List()
+
+	// Automatically set every key from keybase to unlimited fund.
+	for _, entry := range entries {
+		address := entry.Address
+
+		// Check if a predefined amount has been set for this key.
+
+		// Check for address
+		if preDefinedFound, ok := cfg.premineAccounts[address.String()]; ok && preDefinedFound != nil {
+			bls[address] = gnoland.Balance{Amount: preDefinedFound, Address: address}
+			continue
+		}
+
+		// Check for name
+		found := premineBalance
+		for _, name := range entry.Names {
+			if preDefinedFound, ok := cfg.premineAccounts[name]; ok && preDefinedFound != nil {
+				found = preDefinedFound
+				break
+			}
+		}
+
+		bls[address] = gnoland.Balance{Amount: found, Address: address}
+	}
+
+	if cfg.balancesFile == "" {
+		return bls, nil
+	}
+
+	// Load balance file
+
+	file, err := os.Open(cfg.balancesFile)
+	if err != nil {
+		return nil, fmt.Errorf("unable to open balance file %q: %w", cfg.balancesFile, err)
+	}
+
+	blsFile, err := gnoland.GetBalancesFromSheet(file)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read balances file %q: %w", cfg.balancesFile, err)
+	}
+
+	// Add balance address to AddressBook
+	for addr := range blsFile {
+		bk.Add(addr, "")
+	}
+
+	// Left merge keybase balance into loaded file balance.
+	// TL;DR: balance file override every balance at the end
+	blsFile.LeftMerge(bls)
+	return blsFile, nil
+}
+
+func logAccounts(ctx context.Context, logger *slog.Logger, book *address.Book, devNode *dev.Node) error {
+	var tab strings.Builder
+	tabw := tabwriter.NewWriter(&tab, 0, 0, 2, ' ', tabwriter.TabIndent)
+
+	entries := book.List()
+
+	fmt.Fprintln(tabw, "KeyName\tAddress\tBalance") // Table header.
+
+	// Bind a Local client to the devnode's RPC environment so queries
+	// go through this node's handlers rather than relying on globals.
+	rpcClient := client.NewLocal(devNode.Node.RPCEnvironment())
+
+	for _, entry := range entries {
+		address := entry.Address.String()
+
+		// Query the bank rather than the account object: an account's Coins
+		// field holds only gas denoms, so a realm-issued coin minted during
+		// the dev session would silently not appear here.
+		qres, err := rpcClient.ABCIQuery(ctx, "bank/balances/"+address, []byte{})
+		if err != nil {
+			return fmt.Errorf("unable to query balances for %q: %w", address, err)
+		}
+
+		var balance std.Coins
+		if err = amino.UnmarshalJSON(qres.Response.Data, &balance); err != nil {
+			return fmt.Errorf("unable to unmarshal query response: %w", err)
+		}
+
+		if len(entry.Names) == 0 {
+			// Insert row with name, address, and balance amount.
+			fmt.Fprintf(tabw, "%s\t%s\t%s\n", "_", address, balance.String())
+			continue
+		}
+
+		for _, name := range entry.Names {
+			// Insert row with name, address, and balance amount.
+			fmt.Fprintf(tabw, "%s\t%s\t%s\n", name, address, balance.String())
+		}
+	}
+
+	// Flush table.
+	tabw.Flush()
+
+	headline := fmt.Sprintf("(%d) known keys", len(entries))
+	logger.Info(headline, "table", tab.String())
+	return nil
+}

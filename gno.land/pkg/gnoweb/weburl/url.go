@@ -1,0 +1,422 @@
+package weburl
+
+import (
+	"errors"
+	"fmt"
+	"net/url"
+	gopath "path"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+var ErrURLInvalidPath = errors.New("invalid path")
+
+const (
+	maxPathLength     = 4096
+	maxErrorPathBytes = 128
+)
+
+// clipPath limits values included in parse errors.
+func clipPath(path string) string {
+	if len(path) <= maxErrorPathBytes {
+		return path
+	}
+	return path[:maxErrorPathBytes] + "..."
+}
+
+// GnoURL decomposes the parts of an URL to query a realm.
+type GnoURL struct {
+	// Example full path:
+	// gno.land/r/demo/users/render.gno:jae$help&a=b?c=d
+
+	Domain   string     // gno.land
+	Path     string     // /r/gnoland/users/v1
+	Args     string     // jae
+	WebQuery url.Values // help&a=b
+	Query    url.Values // c=d
+	File     string     // render.gno
+	Origin   string     // https://gno.land
+}
+
+// EncodeFlag is used to specify which URL components to encode.
+type EncodeFlag int
+
+const (
+	EncodeDomain   EncodeFlag = 1 << iota // Encode the domain component
+	EncodePath                            // Encode the path component
+	EncodeArgs                            // Encode the arguments component
+	EncodeWebQuery                        // Encode the web query component
+	EncodeQuery                           // Encode the query component
+	EncodeNoEscape                        // Disable escaping of arguments
+)
+
+// Encode constructs a URL string from the components of a GnoURL struct,
+// encoding the specified components based on the provided EncodeFlag bitmask.
+//
+// The function selectively encodes the URL's path, arguments, web query, and
+// query parameters, depending on the flags set in encodeFlags.
+//
+// Returns a string representing the encoded URL.
+//
+// Example:
+//
+//	gnoURL := GnoURL{
+//	    Domain: "gno.land",
+//	    Path:   "/r/demo/users",
+//	    Args:   "john",
+//	    File:   "render.gno",
+//	}
+//
+//	encodedURL := gnoURL.Encode(EncodePath | EncodeArgs)
+//	fmt.Println(encodedURL) // Output: /r/demo/users/render.gno:john
+//
+// URL components are encoded using url.PathEscape unless EncodeNoEscape is specified.
+func (gnoURL GnoURL) Encode(encodeFlags EncodeFlag) string {
+	var urlstr strings.Builder
+
+	escape := !encodeFlags.Has(EncodeNoEscape)
+
+	if encodeFlags.Has(EncodeDomain) {
+		urlstr.WriteString(gnoURL.Domain)
+	}
+
+	if encodeFlags.Has(EncodePath) {
+		path := gnoURL.Path
+		urlstr.WriteString(path)
+	}
+
+	if len(gnoURL.File) > 0 {
+		urlstr.WriteRune('/')
+		urlstr.WriteString(gnoURL.File)
+	}
+
+	if encodeFlags.Has(EncodeArgs) && gnoURL.Args != "" {
+		if encodeFlags.Has(EncodePath) {
+			urlstr.WriteRune(':')
+		}
+
+		// PathEscape encodes everything including slashes.
+		// $ is also encoded. NoEscape only encodes ?.
+		args := gnoURL.Args
+		if escape {
+			escaped := url.PathEscape(args)
+			args = strings.ReplaceAll(escaped, "$", "%24")
+		} else {
+			args = strings.ReplaceAll(args, "?", "%3F")
+		}
+
+		urlstr.WriteString(args)
+	}
+
+	// webquery & query should always be encoded, regardless.
+
+	if encodeFlags.Has(EncodeWebQuery) && len(gnoURL.WebQuery) > 0 {
+		urlstr.WriteRune('$')
+		urlstr.WriteString(EncodeValues(gnoURL.WebQuery, true))
+	}
+
+	if encodeFlags.Has(EncodeQuery) && len(gnoURL.Query) > 0 {
+		urlstr.WriteRune('?')
+		urlstr.WriteString(EncodeValues(gnoURL.Query, true))
+	}
+
+	return urlstr.String()
+}
+
+// Has checks if the EncodeFlag contains all the specified flags.
+func (f EncodeFlag) Has(flags EncodeFlag) bool {
+	return f&flags != 0
+}
+
+// EncodeArgs encodes the arguments and query parameters into a string.
+// This function is intended to be passed as a realm `Render` argument.
+func (gnoURL GnoURL) EncodeArgs() string {
+	return gnoURL.Encode(EncodeArgs | EncodeQuery | EncodeNoEscape)
+}
+
+// EncodeURL encodes the path, arguments, and query parameters into a string.
+// This function provides the full representation of the URL without the web query.
+func (gnoURL GnoURL) EncodeURL() string {
+	return gnoURL.Encode(EncodePath | EncodeArgs | EncodeQuery | EncodeNoEscape)
+}
+
+// EncodeWebURL encodes the path, package arguments, web query, and query into a string.
+// This function provides the full representation of the URL.
+// Slashes in args are unescaped for readability.
+func (gnoURL GnoURL) EncodeWebURL() string {
+	encoded := gnoURL.Encode(EncodePath | EncodeArgs | EncodeWebQuery | EncodeQuery)
+	return strings.ReplaceAll(encoded, "%2F", "/")
+}
+
+// EncodeFormURL encodes the URL for form redirects.
+// Slashes remain encoded as %2F.
+func (gnoURL GnoURL) EncodeFormURL() string {
+	return gnoURL.Encode(EncodePath | EncodeArgs | EncodeQuery)
+}
+
+// Clone returns a deep copy with independent WebQuery and Query maps,
+// safe for mutation without aliasing the original. Slice values
+// inside the maps are *not* deep-copied — fine for our usage where
+// each value is a small `[]string` we treat as immutable.
+func (gnoURL GnoURL) Clone() GnoURL {
+	dup := gnoURL
+	dup.WebQuery = cloneValues(gnoURL.WebQuery)
+	dup.Query = cloneValues(gnoURL.Query)
+	return dup
+}
+
+// Height returns the historical block height the URL is pinned to,
+// reading from either WebQuery (gnoweb's native `$state&height=N`
+// syntax) or the standard Query (browser GET form produces
+// `?height=N`). WebQuery wins when both are set. Returns 0 when
+// missing/invalid/non-positive — i.e. "latest height".
+func (gnoURL GnoURL) Height() int64 {
+	if h := parseHeight(gnoURL.WebQuery.Get("height")); h > 0 {
+		return h
+	}
+	return parseHeight(gnoURL.Query.Get("height"))
+}
+
+// WithHeight returns a clone with the height parameter set in the
+// WebQuery (gnoweb-native form). When `h <= 0`, equivalent to
+// WithoutHeight (strips the parameter from both maps).
+func (gnoURL GnoURL) WithHeight(h int64) GnoURL {
+	clone := gnoURL.Clone()
+	delete(clone.Query, "height")
+	if h > 0 {
+		clone.WebQuery.Set("height", fmt.Sprintf("%d", h))
+	} else {
+		delete(clone.WebQuery, "height")
+	}
+	return clone
+}
+
+// WithoutHeight returns a clone with the height parameter stripped
+// from both WebQuery and Query. Used to build the "go back to live"
+// link when the page is pinned to a historical block.
+func (gnoURL GnoURL) WithoutHeight() GnoURL {
+	clone := gnoURL.Clone()
+	delete(clone.WebQuery, "height")
+	delete(clone.Query, "height")
+	return clone
+}
+
+func parseHeight(s string) int64 {
+	// Cap input length to int64's max digit count (19) so ParseInt's
+	// ErrRange catches overflows cleanly without the hand-rolled loop
+	// wrapping twice. Reject sign prefixes explicitly — only the bare
+	// digit form is valid for a block height.
+	if s == "" || len(s) > 19 || s[0] == '+' || s[0] == '-' {
+		return 0
+	}
+	h, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || h < 0 {
+		return 0
+	}
+	return h
+}
+
+func cloneValues(v url.Values) url.Values {
+	if v == nil {
+		return nil
+	}
+	dup := make(url.Values, len(v))
+	for k, list := range v {
+		clone := make([]string, len(list))
+		copy(clone, list)
+		dup[k] = clone
+	}
+	return dup
+}
+
+// IsPure checks if the URL path prefix represents a pure path.
+func (gnoURL GnoURL) IsPure() bool {
+	return strings.HasPrefix(gnoURL.Path, "/p/") && gnoURL.IsValidPath()
+}
+
+// IsRealm checks if the URL path prefix represents a realm path.
+func (gnoURL GnoURL) IsRealm() bool {
+	return strings.HasPrefix(gnoURL.Path, "/r/") && gnoURL.IsValidPath()
+}
+
+// IsUser checks if the URL path prefix represents a user path.
+func (gnoURL GnoURL) IsUser() bool {
+	return strings.HasPrefix(gnoURL.Path, "/u/") && gnoURL.IsValidPath()
+}
+
+// IsFile checks if the URL path represents a file.
+func (gnoURL GnoURL) IsFile() bool {
+	return gnoURL.File != ""
+}
+
+// IsDir checks if the URL path represents a directory.
+func (gnoURL GnoURL) IsDir() bool {
+	return !gnoURL.IsFile() && strings.HasSuffix(gnoURL.Path, "/")
+}
+
+// reGnolandPath matches and validates a Gno.land URL path.
+// The minimum path allowed are the Gno.land prefixed ones so listing can be
+// implemented, for example in Gnoweb "/r/" or "/p/" would list the files or
+// directories within those paths.
+// Expression doesn't validate "//" because at this point the URL path should
+// have been validated or normalized by the Gno.land URL parser.
+var reGnolandPath = regexp.MustCompile(`^/[rpu]/([a-z][a-z0-9_/-]*)*$`)
+
+// IsValidPath checks that path is a valid Gno.land URL path.
+// It just validates that the path format can match with Gno.land URL paths, but
+// it doesn't validate semantics, like "/r/", "/p/", etc; Use `IsPure()`,
+// `IsRealm()` or similar methods to check for specific URL path cases.
+func (gnoURL GnoURL) IsValidPath() bool {
+	return len(gnoURL.Path) <= maxPathLength && reGnolandPath.MatchString(gnoURL.Path)
+}
+
+// Extract the package name from the Gno.land URL path (e.g., "/r/test/foo" -> "test")
+func (gnoURL GnoURL) Namespace() string {
+	if !gnoURL.IsValidPath() {
+		return ""
+	}
+
+	path := gnoURL.Path[3:] // skip `/x/`
+	if idx := strings.Index(path, "/"); idx > 1 {
+		return path[:idx] // namespace
+	}
+
+	return path
+}
+
+// Extract the username from the path (e.g., "/u/alice" -> "alice")
+func (gnoURL GnoURL) Username() string {
+	if !gnoURL.IsUser() {
+		return ""
+	}
+
+	return gnoURL.Path[3:] // skip `/u/`
+}
+
+// reURLPath matches and validates a standard URL path compatible with Gno.land URL paths.
+// Expression considers that "/" is the minimum valid path allowed and then optionally
+// allows any characters allowed within different Gno.land URL paths.
+// Expression doesn't validate "//" matches for simplicity, this validation is done
+// separately when parsing the URL.
+var reURLPath = regexp.MustCompile(`^/[a-z0-9_/-]*$`)
+
+// ParseFromURL parses a URL into a GnoURL structure, extracting and validating its components.
+// Grammar: `<path>[:<args>][$<webargs>]`. The `$` split runs first so a
+// literal `:` inside webargs (e.g. ObjectID `<hash>:<n>`) stays in the
+// webargs and doesn't corrupt the path-args split.
+func ParseFromURL(u *url.URL) (*GnoURL, error) {
+	escapedPath := u.EscapedPath()
+
+	pathArgs, webargs, _ := strings.Cut(escapedPath, "$")
+	path, args, _ := strings.Cut(pathArgs, ":")
+
+	// Only the path segment reaches reURLPath/reGnolandPath, so bound it
+	// there. Webargs (e.g. a `$help` form's argument values) can legitimately
+	// be long and are kept out of this limit.
+	if len(path) > maxPathLength {
+		return nil, ErrURLInvalidPath
+	}
+
+	upath, err := url.PathUnescape(path)
+	if err != nil {
+		return nil, fmt.Errorf("unable to unescape path %q: %w", clipPath(path), err)
+	}
+	var file string
+
+	// A file is considered as one that either ends with an extension or
+	// contains an uppercase rune
+	ext := gopath.Ext(upath)
+	base := gopath.Base(upath)
+	if ext != "" || strings.ToLower(base) != base {
+		file = base
+		upath = strings.TrimSuffix(upath, base)
+
+		// Trim last slash if any
+		if i := strings.LastIndexByte(upath, '/'); i > 0 {
+			upath = upath[:i]
+		}
+	}
+
+	// Check that path contains valid characters or is the root "/" path.
+	// Also make sure it doesn't contain "//" which semantically are not
+	// considered valid within Gno.land package paths. The "//" is checked
+	// using contains to keep the URL path regexp simple.
+	if strings.Contains(upath, "//") || !reURLPath.MatchString(upath) {
+		return nil, fmt.Errorf("%w: %q", ErrURLInvalidPath, clipPath(upath))
+	}
+
+	webquery := url.Values{}
+	if len(webargs) > 0 {
+		var parseErr error
+		if webquery, parseErr = url.ParseQuery(webargs); parseErr != nil {
+			return nil, fmt.Errorf("unable to parse webquery %q: %w", clipPath(webargs), parseErr)
+		}
+	}
+
+	uargs, err := url.PathUnescape(args)
+	if err != nil {
+		return nil, fmt.Errorf("unable to unescape args %q: %w", clipPath(args), err)
+	}
+
+	return &GnoURL{
+		Path:     upath,
+		Args:     uargs,
+		WebQuery: webquery,
+		Query:    u.Query(),
+		Domain:   u.Hostname(),
+		File:     file,
+	}, nil
+}
+
+func Parse(u string) (gnourl *GnoURL, err error) {
+	var pu *url.URL
+	if pu, err = url.Parse(u); err == nil {
+		gnourl, err = ParseFromURL(pu)
+	}
+
+	return gnourl, err
+}
+
+// EncodeValues generates a URL-encoded query string from the given url.Values.
+// This function is a modified version of Go's `url.Values.Encode()`: https://pkg.go.dev/net/url#Values.Encode
+// It takes an additional `escape` boolean argument that disables escaping on keys and values.
+// Additionally, if an empty string value is passed, it omits the `=` sign, resulting in `?key` instead of `?key=` to enhance URL readability.
+func EncodeValues(v url.Values, escape bool) string {
+	if len(v) == 0 {
+		return ""
+	}
+	var buf strings.Builder
+	keys := make([]string, 0, len(v))
+	for k := range v {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	for _, k := range keys {
+		vs := v[k]
+		keyEncoded := k
+		if escape {
+			keyEncoded = url.QueryEscape(k)
+		}
+		for _, v := range vs {
+			if buf.Len() > 0 {
+				buf.WriteByte('&')
+			}
+			buf.WriteString(keyEncoded)
+
+			if len(v) == 0 {
+				continue // Skip `=` for empty values
+			}
+
+			buf.WriteByte('=')
+			if escape {
+				buf.WriteString(url.QueryEscape(v))
+			} else {
+				buf.WriteString(v)
+			}
+		}
+	}
+	return buf.String()
+}

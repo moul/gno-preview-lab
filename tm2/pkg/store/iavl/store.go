@@ -1,0 +1,544 @@
+package iavl
+
+import (
+	goerrors "errors"
+	"fmt"
+	"math/bits"
+	"sync"
+
+	ics23 "github.com/cosmos/ics23/go"
+
+	abci "github.com/gnolang/gno/tm2/pkg/bft/abci/types"
+	"github.com/gnolang/gno/tm2/pkg/crypto/merkle"
+	dbm "github.com/gnolang/gno/tm2/pkg/db"
+	"github.com/gnolang/gno/tm2/pkg/errors"
+	"github.com/gnolang/gno/tm2/pkg/iavl"
+	"github.com/gnolang/gno/tm2/pkg/std"
+	"github.com/gnolang/gno/tm2/pkg/store/cache"
+	serrors "github.com/gnolang/gno/tm2/pkg/store/errors"
+	"github.com/gnolang/gno/tm2/pkg/store/types"
+)
+
+const (
+	defaultIAVLCacheSize = 10000
+)
+
+// Implements store.CommitStoreConstructor.
+func StoreConstructor(db dbm.DB, opts types.StoreOptions) types.CommitStore {
+	tree := iavl.NewMutableTree(db, defaultIAVLCacheSize, true, iavl.NewNopLogger())
+	store := UnsafeNewStore(tree, opts)
+	return store
+}
+
+// ----------------------------------------
+
+var (
+	_ types.Store          = (*Store)(nil)
+	_ types.CommitStore    = (*Store)(nil)
+	_ types.Queryable      = (*Store)(nil)
+	_ types.DepthEstimator = (*Store)(nil)
+)
+
+// expectedDepth100 returns floor(log2(size)) + 1, scaled by 100 for
+// fixed-point depth estimation. Size is consensus state — constant
+// within a block.
+func expectedDepth100(size int64) int64 {
+	if size <= 1 {
+		return 100
+	}
+	return int64(bits.Len64(uint64(size))) * 100
+}
+
+// For IAVL (no fast nodes), all three depths are the same — full tree depth.
+func (st *Store) ExpectedGetReadDepth100() int64 { return expectedDepth100(st.tree.Size()) }
+func (st *Store) ExpectedSetReadDepth100() int64 { return expectedDepth100(st.tree.Size()) }
+func (st *Store) ExpectedWriteDepth100() int64   { return expectedDepth100(st.tree.Size()) }
+
+// Store Implements types.Store and CommitStore.
+type Store struct {
+	tree Tree
+	opts types.StoreOptions
+	// initialVersion, when > 0, is the chain's first persisted version
+	// (set via SetInitialVersion from BaseApp.InitChain on hardfork chains).
+	// Used by Commit() to skip the prune branch for toRelease < initialVersion,
+	// avoiding a per-Commit no-op DeleteVersionsTo call. 0 for standard chains.
+	initialVersion int64
+}
+
+func UnsafeNewStore(tree *iavl.MutableTree, opts types.StoreOptions) *Store {
+	st := &Store{
+		tree: tree,
+		opts: opts,
+	}
+	return st
+}
+
+// GetImmutable returns a reference to a new store backed by an immutable IAVL
+// tree at a specific version (height) without any pruning options. This should
+// be used for querying and iteration only. If the version does not exist or has
+// been pruned, an error will be returned. Any mutable operations executed will
+// result in a panic.
+func (st *Store) GetImmutable(version int64) (*Store, error) {
+	if !st.VersionExists(version) {
+		return nil, iavl.ErrVersionDoesNotExist
+	}
+
+	iTree, err := st.tree.GetImmutable(version)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := st.opts
+	opts.Immutable = true
+
+	return &Store{
+		tree: &immutableTree{iTree},
+		opts: opts,
+	}, nil
+}
+
+// Implements Committer.
+func (st *Store) Commit() types.CommitID {
+	// Save a new version.
+	hash, version, err := st.tree.SaveVersion()
+	if err != nil {
+		// TODO: Do we want to extend Commit to allow returning errors?
+		panic(err)
+	}
+
+	// Release an old version of history, if not a sync waypoint. Skip when
+	// toRelease is below the chain's initial version (set via
+	// SetInitialVersion). For standard chains, initialVersion=0 so the check
+	// is always-true and existing behavior is preserved byte-identically.
+	previous := version - 1
+	if previous > st.opts.KeepRecent {
+		toRelease := previous - st.opts.KeepRecent
+		if toRelease >= st.initialVersion {
+			if st.opts.KeepEvery == 0 || toRelease%st.opts.KeepEvery != 0 {
+				err := st.tree.DeleteVersionsTo(toRelease)
+				if errCause := errors.Cause(err); errCause != nil && !goerrors.Is(errCause, iavl.ErrVersionDoesNotExist) {
+					panic(err)
+				}
+			}
+		}
+	}
+
+	return types.CommitID{
+		Version: version,
+		Hash:    hash,
+	}
+}
+
+// Implements Committer.
+func (st *Store) LastCommitID() types.CommitID {
+	return types.CommitID{
+		Version: st.tree.Version(),
+		Hash:    st.tree.Hash(),
+	}
+}
+
+// SetInitialVersion sets the version that the next Commit() will produce
+// (via the underlying MutableTree) AND records initialVersion on the Store
+// for the prune-skip guard. Used at chain initialization (InitChain) to
+// align the multistore's commit version with the chain's InitialHeight when
+// starting a hardfork chain at height > 1. Has no effect on the iavl tree
+// once it has any saved versions; the initialVersion field is set
+// unconditionally for the prune guard. Implements types.InitialVersionSetter.
+func (st *Store) SetInitialVersion(v int64) {
+	mt, ok := st.tree.(*iavl.MutableTree)
+	if !ok {
+		panic("SetInitialVersion on immutable iavl store")
+	}
+	mt.SetInitialVersion(uint64(v))
+	st.initialVersion = v
+}
+
+// Implements Committer.
+func (st *Store) GetStoreOptions() types.StoreOptions {
+	return st.opts
+}
+
+// Implements Committer.
+func (st *Store) SetStoreOptions(opts2 types.StoreOptions) {
+	st.opts = opts2
+}
+
+// Implements Committer.
+func (st *Store) LoadLatestVersion() error {
+	version, err := st.tree.GetLatestVersion()
+	if err != nil {
+		return err
+	}
+	return st.LoadVersion(version)
+}
+
+// Implements Committer.
+func (st *Store) LoadVersion(ver int64) error {
+	if st.opts.Immutable {
+		immutTree, err := st.tree.(*iavl.MutableTree).GetImmutable(ver)
+		if err != nil {
+			return err
+		}
+		st.tree = &immutableTree{immutTree}
+		return nil
+	}
+	_, err := st.tree.(*iavl.MutableTree).LoadVersion(ver)
+	return err
+}
+
+// VersionExists returns whether or not a given version is stored.
+func (st *Store) VersionExists(version int64) bool {
+	return st.tree.VersionExists(version)
+}
+
+// Implements Store.
+func (st *Store) CacheWrap() types.Store {
+	return cache.New(st)
+}
+
+// Implements Store.
+func (st *Store) Write() {
+	panic("unexpected .Write() on iavl.Store. Hash()?")
+}
+
+// Implements types.Store.
+func (st *Store) Set(gctx *types.GasContext, key, value []byte) {
+	types.AssertValidValue(value)
+	_, err := st.tree.Set(key, value)
+	if err != nil {
+		panic(err)
+	}
+}
+
+// Implements types.Store.
+func (st *Store) Get(gctx *types.GasContext, key []byte) (value []byte) {
+	v, err := st.tree.Get(key)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// Implements types.Store.
+func (st *Store) Has(gctx *types.GasContext, key []byte) (exists bool) {
+	has, err := st.tree.Has(key)
+	if err != nil {
+		panic(err)
+	}
+	return has
+}
+
+// Implements types.Store.
+func (st *Store) Delete(gctx *types.GasContext, key []byte) {
+	_, _, err := st.tree.Remove(key)
+	if err != nil {
+		panic(err)
+	}
+}
+
+// Implements types.Store.
+//
+// Iterator does not charge gas. Gas is charged by cache.Store, which
+// wraps this store on gas-metered production paths.
+func (st *Store) Iterator(gctx *types.GasContext, start, end []byte) types.Iterator {
+	var iTree *iavl.ImmutableTree
+
+	switch tree := st.tree.(type) {
+	case *immutableTree:
+		iTree = tree.ImmutableTree
+	case *iavl.MutableTree:
+		iTree = tree.ImmutableTree
+	}
+
+	return newIAVLIterator(iTree, start, end, true)
+}
+
+// Implements types.Store.
+//
+// ReverseIterator does not charge gas. See Iterator.
+func (st *Store) ReverseIterator(gctx *types.GasContext, start, end []byte) types.Iterator {
+	var iTree *iavl.ImmutableTree
+
+	switch tree := st.tree.(type) {
+	case *immutableTree:
+		iTree = tree.ImmutableTree
+	case *iavl.MutableTree:
+		iTree = tree.ImmutableTree
+	}
+
+	return newIAVLIterator(iTree, start, end, false)
+}
+
+// Handle gatest the latest height, if height is 0
+func getHeight(tree Tree, req abci.RequestQuery) int64 {
+	height := req.Height
+	if height == 0 {
+		latest := tree.Version()
+		if tree.VersionExists(latest - 1) {
+			height = latest - 1
+		} else {
+			height = latest
+		}
+	}
+	return height
+}
+
+// Query implements ABCI interface, allows queries
+//
+// by default we will return from (latest height -1),
+// as we will have merkle proofs immediately (header height = data height + 1)
+// If latest-1 is not present, use latest (which must be present)
+// if you care to have the latest data to see a tx results, you must
+// explicitly set the height you want to see
+func (st *Store) Query(req abci.RequestQuery) (res abci.ResponseQuery) {
+	if len(req.Data) == 0 {
+		msg := "Query cannot be zero length"
+		res.Error = serrors.ErrTxDecode(msg)
+		return
+	}
+
+	tree := st.tree
+
+	// store the height we chose in the response, with 0 being changed to the
+	// latest height
+	res.Height = getHeight(tree, req)
+
+	switch req.Path {
+	case "/key": // get by key
+		key := req.Data // data holds the key bytes
+
+		res.Key = key
+		if !st.VersionExists(res.Height) {
+			res.Log = errors.Wrap(iavl.ErrVersionDoesNotExist, "").Error()
+			break
+		}
+
+		value, err := tree.GetVersioned(key, res.Height)
+		if err != nil {
+			res.Log = err.Error()
+			break
+		}
+		res.Value = value
+
+		if !req.Prove {
+			break
+		}
+
+		// Continue to prove existence/absence of value
+		// Must convert store.Tree to iavl.MutableTree with given version
+		iTree, err := tree.GetImmutable(res.Height)
+		if err != nil {
+			// sanity check: If value for given version was retrieved, immutable tree must also be retrievable
+			panic(fmt.Sprintf("version exists in store but could not retrieve corresponding versioned tree in store, %v", err))
+		}
+		mtree := &iavl.MutableTree{
+			ImmutableTree: iTree,
+		}
+
+		// Generate ics23 proof
+		var proof *ics23.CommitmentProof
+		if value != nil {
+			// Get existence proof
+			proof, err = mtree.GetMembershipProof(key)
+		} else {
+			// Get non-existence proof
+			proof, err = mtree.GetNonMembershipProof(key)
+		}
+		if err != nil {
+			res.Log = err.Error()
+			break
+		}
+		// Encode and append proof
+		res.Proof = &merkle.Proof{Ops: []merkle.ProofOp{types.NewIavlCommitmentOp(key, proof).ProofOp()}}
+
+	case "/subspace":
+		// DISABLED. The legacy (cosmos-sdk-inherited) handler buffered every
+		// key/value pair under the prefix into memory — response size was
+		// bounded by state contents, not the request, with no cap at any
+		// layer — and the whole drain ran while holding the global ABCI
+		// mutex, stalling consensus for its duration. No in-repo client ever
+		// used it. To reintroduce it bounded (pinned-height snapshot +
+		// capped page + after-key resumption), see the recipe in
+		// tm2/pkg/store/bptree/store.go's /subspace branch.
+		res.Error = serrors.ErrUnknownRequest(
+			"/subspace queries are disabled (unbounded response) — use /key or an indexer")
+
+	default:
+		msg := fmt.Sprintf("Unexpected Query path: %v", req.Path)
+		res.Error = serrors.ErrUnknownRequest(msg)
+		return
+	}
+
+	return
+}
+
+// ----------------------------------------
+
+// Implements types.Iterator.
+type iavlIterator struct {
+	// Underlying store
+	tree *iavl.ImmutableTree
+
+	// Domain
+	start, end []byte
+
+	// Iteration order
+	ascending bool
+
+	// Channel to push iteration values.
+	iterCh chan std.KVPair
+
+	// Close this to release goroutine.
+	quitCh chan struct{}
+
+	// Close this to signal that state is initialized.
+	initCh chan struct{}
+
+	// ----------------------------------------
+	// What follows are mutable state.
+	mtx sync.Mutex
+
+	invalid bool   // True once, true forever
+	key     []byte // The current key
+	value   []byte // The current value
+}
+
+var _ types.Iterator = (*iavlIterator)(nil)
+
+// newIAVLIterator will create a new iavlIterator.
+// CONTRACT: Caller must release the iavlIterator, as each one creates a new
+// goroutine.
+func newIAVLIterator(tree *iavl.ImmutableTree, start, end []byte, ascending bool) *iavlIterator {
+	iter := &iavlIterator{
+		tree:      tree,
+		start:     types.Cp(start),
+		end:       types.Cp(end),
+		ascending: ascending,
+		iterCh:    make(chan std.KVPair), // Set capacity > 0?
+		quitCh:    make(chan struct{}),
+		initCh:    make(chan struct{}),
+	}
+	go iter.iterateRoutine()
+	go iter.initRoutine()
+	return iter
+}
+
+// Run this to funnel items from the tree to iterCh.
+func (iter *iavlIterator) iterateRoutine() {
+	iter.tree.IterateRange(
+		iter.start, iter.end, iter.ascending,
+		func(key, value []byte) bool {
+			select {
+			case <-iter.quitCh:
+				return true // done with iteration.
+			case iter.iterCh <- std.KVPair{Key: key, Value: value}:
+				return false // yay.
+			}
+		},
+	)
+	close(iter.iterCh) // done.
+}
+
+// Run this to fetch the first item.
+func (iter *iavlIterator) initRoutine() {
+	iter.receiveNext()
+	close(iter.initCh)
+}
+
+// Implements types.Iterator.
+func (iter *iavlIterator) Domain() (start, end []byte) {
+	return iter.start, iter.end
+}
+
+// Implements types.Iterator.
+func (iter *iavlIterator) Valid() bool {
+	iter.waitInit()
+	iter.mtx.Lock()
+
+	validity := !iter.invalid
+	iter.mtx.Unlock()
+	return validity
+}
+
+// Implements types.Iterator.
+func (iter *iavlIterator) Next() {
+	iter.waitInit()
+	iter.mtx.Lock()
+	iter.assertIsValid(true)
+
+	iter.receiveNext()
+	iter.mtx.Unlock()
+}
+
+// Implements types.Iterator.
+func (iter *iavlIterator) Key() []byte {
+	iter.waitInit()
+	iter.mtx.Lock()
+	iter.assertIsValid(true)
+
+	key := iter.key
+	iter.mtx.Unlock()
+	return key
+}
+
+// Implements types.Iterator.
+func (iter *iavlIterator) Value() []byte {
+	iter.waitInit()
+	iter.mtx.Lock()
+	iter.assertIsValid(true)
+
+	val := iter.value
+	iter.mtx.Unlock()
+	return val
+}
+
+// Implements types.Iterator.
+func (iter *iavlIterator) Close() error {
+	close(iter.quitCh)
+	return nil
+}
+
+// Implements types.Iterator.
+func (iter *iavlIterator) Error() error {
+	return nil
+}
+
+// ----------------------------------------
+
+func (iter *iavlIterator) setNext(key, value []byte) {
+	iter.assertIsValid(false)
+
+	iter.key = key
+	iter.value = value
+}
+
+func (iter *iavlIterator) setInvalid() {
+	iter.assertIsValid(false)
+
+	iter.invalid = true
+}
+
+func (iter *iavlIterator) waitInit() {
+	<-iter.initCh
+}
+
+func (iter *iavlIterator) receiveNext() {
+	kvPair, ok := <-iter.iterCh
+	if ok {
+		iter.setNext(kvPair.Key, kvPair.Value)
+	} else {
+		iter.setInvalid()
+	}
+}
+
+// assertIsValid panics if the iterator is invalid. If unlockMutex is true,
+// it also unlocks the mutex before panicking, to prevent deadlocks in code that
+// recovers from panics
+func (iter *iavlIterator) assertIsValid(unlockMutex bool) {
+	if iter.invalid {
+		if unlockMutex {
+			iter.mtx.Unlock()
+		}
+		panic("invalid iterator")
+	}
+}

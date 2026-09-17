@@ -1,0 +1,910 @@
+package vm
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/gnolang/gno/gnovm/pkg/doc"
+	"github.com/gnolang/gno/gnovm/pkg/gnolang"
+	abci "github.com/gnolang/gno/tm2/pkg/bft/abci/types"
+	"github.com/gnolang/gno/tm2/pkg/crypto"
+	"github.com/gnolang/gno/tm2/pkg/sdk"
+	"github.com/gnolang/gno/tm2/pkg/std"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func Test_parseQueryEvalData(t *testing.T) {
+	t.Parallel()
+	tt := []struct {
+		input   string
+		pkgpath string
+		expr    string
+	}{
+		{
+			"gno.land/r/realm.Expression()",
+			"gno.land/r/realm",
+			"Expression()",
+		},
+		{
+			"a.b/c/d.e",
+			"a.b/c/d",
+			"e",
+		},
+		{
+			"a.b.c.d.e/c/d.e",
+			"a.b.c.d.e/c/d",
+			"e",
+		},
+		{
+			"abcde/c/d.e",
+			"abcde/c/d",
+			"e",
+		},
+	}
+	for _, tc := range tt {
+		path, expr := parseQueryEvalData(tc.input)
+		assert.Equal(t, tc.pkgpath, path)
+		assert.Equal(t, tc.expr, expr)
+	}
+}
+
+func Test_parseQueryEval_panic(t *testing.T) {
+	t.Parallel()
+
+	assert.PanicsWithValue(t, panicInvalidQueryEvalData, func() {
+		parseQueryEvalData("gno.land/r/sys/users")
+	})
+}
+
+func TestVmHandlerQuery_Eval(t *testing.T) {
+	tt := []struct {
+		input               []byte
+		expectedResult      string
+		expectedResultMatch string
+		expectedErrorMatch  string
+		expectedPanicMatch  string
+		// XXX: expectedEvents
+	}{
+		// valid queries
+		{input: []byte(`gno.land/r/hello.Echo("hello")`), expectedResult: `("echo:hello" string)`},
+		{input: []byte(`gno.land/r/hello.caller()`), expectedResult: `("" .uverse.address)`}, // FIXME?
+		{input: []byte(`gno.land/r/hello.GetHeight()`), expectedResult: `(42 int64)`},
+		// {input: []byte(`gno.land/r/hello.time.RFC3339`), expectedResult: `test`}, // not working, but should we care?
+		{input: []byte(`gno.land/r/hello.PubString`), expectedResult: `("public string" string)`},
+		{input: []byte(`gno.land/r/hello.ConstString`), expectedResult: `("const string" string)`},
+		{input: []byte(`gno.land/r/hello.pvString`), expectedResult: `("private string" string)`},
+		{input: []byte(`gno.land/r/hello.counter`), expectedResult: `(42 int)`},
+		{input: []byte(`gno.land/r/hello.GetCounter()`), expectedResult: `(42 int)`},
+		{input: []byte(`gno.land/r/hello.Inc()`), expectedResult: `(43 int)`},
+		{input: []byte(`gno.land/r/hello.pvEcho("hello")`), expectedResult: `("pvecho:hello" string)`},
+		{input: []byte(`gno.land/r/hello.1337`), expectedResult: `(1337 int)`},
+		{input: []byte(`gno.land/r/hello.13.37`), expectedResult: `(13.37 float64)`},
+		{input: []byte(`gno.land/r/hello.float64(1337)`), expectedResult: `(1337 float64)`},
+		{input: []byte(`gno.land/r/hello.myStructInst`), expectedResult: `(struct{(1000 int)} gno.land/r/hello.myStruct)`},
+		{input: []byte(`gno.land/r/hello.myStructInst.Foo()`), expectedResult: `("myStruct.Foo" string)`},
+		{input: []byte(`gno.land/r/hello.myStruct`), expectedResultMatch: `\(typeval{gno.land/r/hello.myStruct} type{}\)`},
+		{input: []byte(`gno.land/r/hello.Inc`), expectedResult: `(Inc func() int)`},
+		{input: []byte(`gno.land/r/hello.fn()("hi")`), expectedResult: `("echo:hi" string)`},
+		{input: []byte(`gno.land/r/hello.sl`), expectedResultMatch: `(slice[ref(.*)] []int)`},    // XXX: should return the actual value
+		{input: []byte(`gno.land/r/hello.sl[1]`), expectedResultMatch: `(slice[ref(.*)] []int)`}, // XXX: should return the actual value
+		{input: []byte(`gno.land/r/hello.println(1234)`), expectedResultMatch: `^$`},             // XXX: compare stdout?
+		{
+			input:          []byte(`gno.land/r/hello.(func() string { return "hello123" + pvString })()`),
+			expectedResult: `("hello123private string" string)`,
+		},
+
+		// panics
+		{input: []byte(`gno.land/r/hello`), expectedPanicMatch: `expected <pkgpath>.<expression> syntax in query input data`},
+
+		// errors
+		{input: []byte(`gno.land/r/hello.doesnotexist`), expectedErrorMatch: `^:0:0: name doesnotexist not declared:`}, // multiline error
+		{input: []byte(`gno.land/r/doesnotexist.Foo`), expectedErrorMatch: `^invalid package path$`},
+		{input: []byte(`gno.land/r/hello.Panic()`), expectedErrorMatch: `^foo$`},
+		{input: []byte(`gno.land/r/hello.sl[6]`), expectedErrorMatch: `^runtime error: slice index out of bounds: 6 \(len=5\)$`},
+		{input: []byte(`gno.land/r/hello.func(){ for {} }()`), expectedErrorMatch: `out of gas in location: CPUCycles`},
+	}
+
+	for _, tc := range tt {
+		name := string(tc.input)
+		t.Run(name, func(t *testing.T) {
+			env := setupTestEnv()
+			ctx := env.vmk.MakeGnoTransactionStore(env.ctx)
+			vmHandler := env.vmh
+
+			// Give "addr1" some gnots.
+			addr := crypto.AddressFromPreimage([]byte("addr1"))
+			acc := env.acck.NewAccountWithAddress(ctx, addr)
+			env.acck.SetAccount(ctx, acc)
+			env.bankk.SetCoins(ctx, addr, std.MustParseCoins("10000000ugnot"))
+			assert.True(t, env.bankk.GetCoins(ctx, addr).IsEqual(std.MustParseCoins("10000000ugnot")))
+			const pkgpath = "gno.land/r/hello"
+			// Create test package.
+			files := []*std.MemFile{
+				{Name: "gnomod.toml", Body: gnolang.GenGnoModLatest(pkgpath)},
+				{Name: "hello.gno", Body: `
+package hello
+
+import (
+	"chain/runtime"
+	"chain/runtime/unsafe"
+	"time"
+)
+
+var _ = time.RFC3339
+func caller() address { return unsafe.OriginCaller() }
+var GetHeight = runtime.ChainHeight
+var sl = []int{1,2,3,4,5}
+func fn() func(string) string { return Echo }
+type myStruct struct{a int}
+var myStructInst = myStruct{a: 1000}
+func (ms myStruct) Foo() string { return "myStruct.Foo" }
+func Panic() { panic("foo") }
+var counter int = 42
+var Hook func() // typed-nil func: QueryFuncs must skip rather than crash
+var pvString = "private string"
+var PubString = "public string"
+const ConstString = "const string"
+func Echo(msg string) string { return "echo:"+msg }
+func GetCounter() int { return counter }
+func Inc() int { counter += 1; return counter }
+func pvEcho(msg string) string { return "pvecho:"+msg }
+`},
+			}
+			pkgPath := "gno.land/r/hello"
+			msg1 := NewMsgAddPackage(addr, pkgPath, files)
+			err := env.vmk.AddPackage(ctx, msg1)
+			assert.NoError(t, err)
+			env.vmk.CommitGnoTransactionStore(ctx)
+
+			req := abci.RequestQuery{
+				Path: "vm/qeval",
+				Data: tc.input,
+			}
+
+			defer func() {
+				if r := recover(); r != nil {
+					output := fmt.Sprintf("%v", r)
+					assert.Regexp(t, tc.expectedPanicMatch, output)
+				} else {
+					assert.Equal(t, tc.expectedPanicMatch, "", "should not panic")
+				}
+			}()
+			res := vmHandler.Query(env.ctx, req)
+			if tc.expectedPanicMatch == "" {
+				if tc.expectedErrorMatch == "" {
+					assert.True(t, res.IsOK(), "should not have error")
+					if tc.expectedResult != "" {
+						assert.Equal(t, tc.expectedResult, string(res.Data))
+					}
+					if tc.expectedResultMatch != "" {
+						assert.Regexp(t, tc.expectedResultMatch, string(res.Data))
+					}
+				} else {
+					assert.False(t, res.IsOK(), "should have an error")
+					errmsg := res.Error.Error()
+					assert.Regexp(t, tc.expectedErrorMatch, errmsg)
+				}
+			}
+		})
+	}
+}
+
+func TestVmHandlerQuery_Funcs(t *testing.T) {
+	tt := []struct {
+		input              []byte
+		expectedResult     string
+		expectedErrorMatch string
+	}{
+		// valid queries
+		{input: []byte(`gno.land/r/hello`), expectedResult: `[{"FuncName":"Panic","Params":null,"Results":null},{"FuncName":"Echo","Params":[{"Name":"msg","Type":"string","Value":""}],"Results":[{"Name":".res.0","Type":"string","Value":""}]},{"FuncName":"GetCounter","Params":null,"Results":[{"Name":".res.0","Type":"int","Value":""}]},{"FuncName":"Inc","Params":null,"Results":[{"Name":".res.0","Type":"int","Value":""}]}]`},
+		{input: []byte(`gno.land/r/doesnotexist`), expectedErrorMatch: `invalid package path`},
+		{input: []byte(`std`), expectedErrorMatch: `invalid package path`},
+		{input: []byte(`strings`), expectedErrorMatch: `invalid package path`},
+	}
+
+	for _, tc := range tt {
+		name := string(tc.input)
+		t.Run(name, func(t *testing.T) {
+			env := setupTestEnv()
+			ctx := env.vmk.MakeGnoTransactionStore(env.ctx)
+			vmHandler := env.vmh
+
+			// Give "addr1" some gnots.
+			addr := crypto.AddressFromPreimage([]byte("addr1"))
+			acc := env.acck.NewAccountWithAddress(ctx, addr)
+			env.acck.SetAccount(ctx, acc)
+			env.bankk.SetCoins(ctx, addr, std.MustParseCoins("10000000ugnot"))
+			assert.True(t, env.bankk.GetCoins(ctx, addr).IsEqual(std.MustParseCoins("10000000ugnot")))
+
+			const pkgpath = "gno.land/r/hello"
+			// Create test package.
+			files := []*std.MemFile{
+				{Name: "gnomod.toml", Body: gnolang.GenGnoModLatest(pkgpath)},
+				{Name: "hello.gno", Body: `
+package hello
+
+var sl = []int{1,2,3,4,5}
+func fn() func(string) string { return Echo }
+type myStruct struct{a int}
+var myStructInst = myStruct{a: 1000}
+func (ms myStruct) Foo() string { return "myStruct.Foo" }
+func Panic() { panic("foo") }
+var counter int = 42
+var Hook func() // typed-nil func: QueryFuncs must skip rather than crash
+var pvString = "private string"
+var PubString = "public string"
+const ConstString = "const string"
+func Echo(msg string) string { return "echo:"+msg }
+func GetCounter() int { return counter }
+func Inc() int { counter += 1; return counter }
+func pvEcho(msg string) string { return "pvecho:"+msg }
+`},
+			}
+			pkgPath := "gno.land/r/hello"
+			msg1 := NewMsgAddPackage(addr, pkgPath, files)
+			err := env.vmk.AddPackage(ctx, msg1)
+			assert.NoError(t, err)
+
+			req := abci.RequestQuery{
+				Path: "vm/qfuncs",
+				Data: tc.input,
+			}
+
+			res := vmHandler.Query(env.ctx, req)
+			if tc.expectedErrorMatch == "" {
+				assert.True(t, res.IsOK(), "should not have error")
+				if tc.expectedResult != "" {
+					assert.Equal(t, string(res.Data), tc.expectedResult)
+				}
+			} else {
+				assert.False(t, res.IsOK(), "should have an error")
+				errmsg := res.Error.Error()
+				assert.Regexp(t, tc.expectedErrorMatch, errmsg)
+			}
+		})
+	}
+}
+
+func TestVmHandlerQuery_File(t *testing.T) {
+	tt := []struct {
+		input               []byte
+		expectedResult      string
+		expectedResultMatch string
+		expectedError       error
+		expectedPanicMatch  string
+		expectedLogMatch    string
+		// XXX: expectedEvents
+	}{
+		// valid queries
+		{input: []byte(`gno.land/r/hello/hello.gno`), expectedResult: "package hello\n\nfunc Hello() string { return \"hello\" }\n"},
+		{input: []byte(`gno.land/r/hello/README.md`), expectedResult: "# Hello"},
+		{
+			input:            []byte(`gno.land/r/hello/doesnotexist.gno`),
+			expectedError:    &InvalidFileError{},
+			expectedLogMatch: `file "gno.land/r/hello/doesnotexist.gno" is not available`,
+		},
+		{input: []byte(`gno.land/r/hello`), expectedResult: "README.md\ngnomod.toml\nhello.gno"},
+		{
+			input:            []byte(`gno.land/r/doesnotexist`),
+			expectedError:    &InvalidPackageError{},
+			expectedLogMatch: `package "gno.land/r/doesnotexist" is not available`,
+		},
+		{
+			input:            []byte(`gno.land/r/doesnotexist/hello.gno`),
+			expectedError:    &InvalidFileError{},
+			expectedLogMatch: `file "gno.land/r/doesnotexist/hello.gno" is not available`,
+		},
+	}
+
+	for _, tc := range tt {
+		name := string(tc.input)
+		t.Run(name, func(t *testing.T) {
+			env := setupTestEnv()
+			ctx := env.vmk.MakeGnoTransactionStore(env.ctx)
+			vmHandler := env.vmh
+
+			// Give "addr1" some gnots.
+			addr := crypto.AddressFromPreimage([]byte("addr1"))
+			acc := env.acck.NewAccountWithAddress(ctx, addr)
+			env.acck.SetAccount(ctx, acc)
+			env.bankk.SetCoins(ctx, addr, std.MustParseCoins("10000000ugnot"))
+			assert.True(t, env.bankk.GetCoins(ctx, addr).IsEqual(std.MustParseCoins("10000000ugnot")))
+
+			const pkgpath = "gno.land/r/hello"
+			// Create test package.
+			files := []*std.MemFile{
+				{Name: "README.md", Body: "# Hello"},
+				{Name: "gnomod.toml", Body: gnolang.GenGnoModLatest(pkgpath)},
+				{Name: "hello.gno", Body: "package hello\n\nfunc Hello() string { return \"hello\" }\n"},
+			}
+			pkgPath := "gno.land/r/hello"
+			msg1 := NewMsgAddPackage(addr, pkgPath, files)
+			err := env.vmk.AddPackage(ctx, msg1)
+			assert.NoError(t, err)
+
+			req := abci.RequestQuery{
+				Path: "vm/qfile",
+				Data: tc.input,
+			}
+
+			defer func() {
+				if r := recover(); r != nil {
+					output := fmt.Sprintf("%v", r)
+					assert.Regexp(t, tc.expectedPanicMatch, output)
+				} else {
+					assert.Equal(t, "", tc.expectedPanicMatch, "should not panic")
+				}
+			}()
+			res := vmHandler.Query(env.ctx, req)
+
+			if tc.expectedError == nil {
+				assert.True(t, res.IsOK(), "should not have error")
+				if tc.expectedResult != "" {
+					assert.Equal(t, string(res.Data), tc.expectedResult)
+				}
+				if tc.expectedResultMatch != "" {
+					assert.Regexp(t, tc.expectedResultMatch, string(res.Data))
+				}
+			} else {
+				assert.False(t, res.IsOK(), "should have an error")
+				assert.ErrorIs(t, res.Error, tc.expectedError)
+			}
+
+			if tc.expectedLogMatch != "" {
+				assert.Regexp(t, tc.expectedLogMatch, res.Log)
+			}
+		})
+	}
+}
+
+func TestVmHandlerQuery_EvalJSON(t *testing.T) {
+	tt := []struct {
+		input              []byte
+		expectedContains   []string
+		expectedErrorMatch string
+	}{
+		{
+			input:            []byte(`gno.land/r/hello.Echo("hello")`),
+			expectedContains: []string{`"results":[`, `echo:hello`},
+		},
+		{
+			input:            []byte(`gno.land/r/hello.GetCounter()`),
+			expectedContains: []string{`"results":[`, `PrimitiveType`},
+		},
+		{
+			input:            []byte(`gno.land/r/hello.myStructInst`),
+			expectedContains: []string{`RefValue`, `ObjectID`},
+		},
+		{
+			input:              []byte(`gno.land/r/doesnotexist.Foo`),
+			expectedErrorMatch: `invalid package path`,
+		},
+		{
+			input:              []byte(`gno.land/r/hello.doesnotexist`),
+			expectedErrorMatch: `doesnotexist not declared`,
+		},
+	}
+
+	for _, tc := range tt {
+		name := string(tc.input)
+		t.Run(name, func(t *testing.T) {
+			env := setupTestEnv()
+			ctx := env.vmk.MakeGnoTransactionStore(env.ctx)
+			vmHandler := env.vmh
+
+			addr := crypto.AddressFromPreimage([]byte("addr1"))
+			acc := env.acck.NewAccountWithAddress(ctx, addr)
+			env.acck.SetAccount(ctx, acc)
+			env.bankk.SetCoins(ctx, addr, std.MustParseCoins("10000000ugnot"))
+
+			const pkgpath = "gno.land/r/hello"
+			files := []*std.MemFile{
+				{Name: "gnomod.toml", Body: gnolang.GenGnoModLatest(pkgpath)},
+				{Name: "hello.gno", Body: `
+package hello
+
+type myStruct struct{a int}
+var myStructInst = myStruct{a: 1000}
+func (ms myStruct) Foo() string { return "myStruct.Foo" }
+var counter int = 42
+func Echo(msg string) string { return "echo:"+msg }
+func GetCounter() int { return counter }
+`},
+			}
+			msg1 := NewMsgAddPackage(addr, pkgpath, files)
+			err := env.vmk.AddPackage(ctx, msg1)
+			assert.NoError(t, err)
+			env.vmk.CommitGnoTransactionStore(ctx)
+
+			req := abci.RequestQuery{
+				Path: "vm/qeval_json",
+				Data: tc.input,
+			}
+
+			res := vmHandler.Query(env.ctx, req)
+			if tc.expectedErrorMatch == "" {
+				assert.True(t, res.IsOK(), "should not have error")
+				for _, s := range tc.expectedContains {
+					assert.Contains(t, string(res.Data), s)
+				}
+			} else {
+				assert.False(t, res.IsOK(), "should have an error")
+				assert.Regexp(t, tc.expectedErrorMatch, res.Error.Error())
+			}
+		})
+	}
+}
+
+func TestVmHandlerQuery_ObjectJSON(t *testing.T) {
+	tt := []struct {
+		input              []byte
+		expectedErrorMatch string
+	}{
+		{
+			input:              []byte(`invalid`),
+			expectedErrorMatch: `invalid expression`,
+		},
+		{
+			input:              []byte(`0000000000000000000000000000000000000000:999`),
+			expectedErrorMatch: `object not found`,
+		},
+	}
+
+	for _, tc := range tt {
+		name := string(tc.input)
+		t.Run(name, func(t *testing.T) {
+			env := setupTestEnv()
+			vmHandler := env.vmh
+
+			req := abci.RequestQuery{
+				Path: "vm/qobject_json",
+				Data: tc.input,
+			}
+
+			res := vmHandler.Query(env.ctx, req)
+			assert.False(t, res.IsOK(), "should have an error")
+			assert.Regexp(t, tc.expectedErrorMatch, res.Error.Error())
+		})
+	}
+}
+
+// extractObjectID queries qeval_json for a struct variable and extracts
+// its ObjectID from the JSON response containing a RefValue.
+func extractObjectID(t *testing.T, vmHandler vmHandler, ctx sdk.Context, evalData []byte) string {
+	t.Helper()
+	req := abci.RequestQuery{
+		Path: "vm/qeval_json",
+		Data: evalData,
+	}
+	res := vmHandler.Query(ctx, req)
+	require.True(t, res.IsOK(), "qeval_json should succeed: %v", res.Error)
+
+	// The response JSON contains an ObjectID field within the RefValue.
+	// Parse it out by finding "ObjectID":"<value>" in the JSON.
+	data := string(res.Data)
+	require.Contains(t, data, "ObjectID")
+
+	// Use a simple JSON approach: unmarshal into a generic structure.
+	var parsed struct {
+		Results []json.RawMessage `json:"results"`
+	}
+	err := json.Unmarshal([]byte(data), &parsed)
+	require.NoError(t, err)
+	require.NotEmpty(t, parsed.Results)
+
+	// Find the ObjectID string in the raw JSON.
+	raw := string(parsed.Results[0])
+	idx := strings.Index(raw, `"ObjectID":"`)
+	require.Greater(t, idx, 0, "ObjectID not found in result")
+	start := idx + len(`"ObjectID":"`)
+	end := strings.Index(raw[start:], `"`)
+	require.Greater(t, end, 0)
+	return raw[start : start+end]
+}
+
+func TestVmHandlerQuery_ObjectJSON_Success(t *testing.T) {
+	env := setupTestEnv()
+	ctx := env.vmk.MakeGnoTransactionStore(env.ctx)
+	vmHandler := env.vmh
+
+	addr := crypto.AddressFromPreimage([]byte("addr1"))
+	acc := env.acck.NewAccountWithAddress(ctx, addr)
+	env.acck.SetAccount(ctx, acc)
+	env.bankk.SetCoins(ctx, addr, std.MustParseCoins("10000000ugnot"))
+
+	const pkgpath = "gno.land/r/hello"
+	files := []*std.MemFile{
+		{Name: "gnomod.toml", Body: gnolang.GenGnoModLatest(pkgpath)},
+		{Name: "hello.gno", Body: `
+package hello
+
+type myStruct struct{ a int }
+var myStructInst = myStruct{a: 1000}
+`},
+	}
+	msg1 := NewMsgAddPackage(addr, pkgpath, files)
+	err := env.vmk.AddPackage(ctx, msg1)
+	require.NoError(t, err)
+	env.vmk.CommitGnoTransactionStore(ctx)
+
+	// First, get the ObjectID of myStructInst via qeval_json.
+	oid := extractObjectID(t, vmHandler, env.ctx, []byte(`gno.land/r/hello.myStructInst`))
+	require.NotEmpty(t, oid)
+
+	// Now query qobject_json with the discovered ObjectID.
+	req := abci.RequestQuery{
+		Path: "vm/qobject_json",
+		Data: []byte(oid),
+	}
+	res := vmHandler.Query(env.ctx, req)
+	assert.True(t, res.IsOK(), "qobject_json should succeed, got error: %v", res.Error)
+	assert.Contains(t, string(res.Data), `"objectid"`)
+	assert.Contains(t, string(res.Data), oid)
+}
+
+func TestVmHandlerQuery_ObjectBinary_Success(t *testing.T) {
+	env := setupTestEnv()
+	ctx := env.vmk.MakeGnoTransactionStore(env.ctx)
+	vmHandler := env.vmh
+
+	addr := crypto.AddressFromPreimage([]byte("addr1"))
+	acc := env.acck.NewAccountWithAddress(ctx, addr)
+	env.acck.SetAccount(ctx, acc)
+	env.bankk.SetCoins(ctx, addr, std.MustParseCoins("10000000ugnot"))
+
+	const pkgpath = "gno.land/r/hello"
+	files := []*std.MemFile{
+		{Name: "gnomod.toml", Body: gnolang.GenGnoModLatest(pkgpath)},
+		{Name: "hello.gno", Body: `
+package hello
+
+type myStruct struct{ a int }
+var myStructInst = myStruct{a: 1000}
+`},
+	}
+	msg1 := NewMsgAddPackage(addr, pkgpath, files)
+	err := env.vmk.AddPackage(ctx, msg1)
+	require.NoError(t, err)
+	env.vmk.CommitGnoTransactionStore(ctx)
+
+	// First, get the ObjectID of myStructInst via qeval_json.
+	oid := extractObjectID(t, vmHandler, env.ctx, []byte(`gno.land/r/hello.myStructInst`))
+	require.NotEmpty(t, oid)
+
+	// Now query qobject_binary with the discovered ObjectID.
+	req := abci.RequestQuery{
+		Path: "vm/qobject_binary",
+		Data: []byte(oid),
+	}
+	res := vmHandler.Query(env.ctx, req)
+	assert.True(t, res.IsOK(), "qobject_binary should succeed, got error: %v", res.Error)
+	assert.NotEmpty(t, res.Data, "binary response should not be empty")
+}
+
+func TestVmHandlerQuery_UnknownEndpoint(t *testing.T) {
+	env := setupTestEnv()
+	vmHandler := env.vmh
+
+	req := abci.RequestQuery{
+		Path: "vm/qunknown",
+		Data: []byte(`test`),
+	}
+
+	res := vmHandler.Query(env.ctx, req)
+	assert.False(t, res.IsOK(), "should have an error")
+	assert.Contains(t, res.Error.Error(), "unknown request")
+}
+
+// TestVmHandlerQuery_EvalJSON_MalformedInput documents the inherited panic
+// behavior of parseQueryEvalData: both qeval and qeval_json panic when the
+// request data lacks a `<pkgpath>.<expression>` shape. In production, the
+// ABCI layer's outer recover turns this into an error response at the RPC
+// boundary (see ADR-002 §"Malformed Query Input"). At this unit-test level
+// no outer recover is installed, so the panic surfaces directly.
+func TestVmHandlerQuery_EvalJSON_MalformedInput(t *testing.T) {
+	env := setupTestEnv()
+	vmHandler := env.vmh
+
+	req := abci.RequestQuery{
+		Path: "vm/qeval_json",
+		Data: []byte(`gno.land/r/hello`), // no dot after the slash
+	}
+
+	defer func() {
+		r := recover()
+		require.NotNil(t, r, "qeval_json must panic on malformed input (inherited qeval behavior)")
+		assert.Contains(t, fmt.Sprintf("%v", r), "expected <pkgpath>.<expression> syntax",
+			"panic message should match parseQueryEvalData's const; got: %v", r)
+	}()
+	_ = vmHandler.Query(env.ctx, req)
+}
+
+func TestVmHandlerQuery_Doc(t *testing.T) {
+	expected := &doc.JSONDocumentation{
+		PackagePath: "gno.land/r/hello",
+		PackageLine: "package hello // import \"gno.land/r/hello\"",
+		PackageDoc:  "hello is a package for testing\n",
+		Values: []*doc.JSONValueDecl{
+			{
+				Signature: "const prefix = \"Hello\"",
+				Const:     true,
+				Doc:       "The prefix for the hello message\n",
+				Values: []*doc.JSONValue{
+					{
+						Name: "prefix",
+						Doc:  "",
+						Type: "",
+					},
+				},
+				File: "hello.gno",
+				Line: 9,
+			},
+		},
+		Funcs: []*doc.JSONFunc{
+			{
+				Type:      "",
+				Name:      "Hello",
+				Signature: "func Hello(msg string) (res string)",
+				Doc:       "",
+				Params: []*doc.JSONField{
+					{Name: "msg", Type: "string"},
+				},
+				Results: []*doc.JSONField{
+					{Name: "res", Type: "string"},
+				},
+				File: "hello.gno",
+				Line: 10,
+			},
+			{
+				Type:      "myStruct",
+				Name:      "Foo",
+				Signature: "func (ms myStruct) Foo() string",
+				Doc:       "",
+				Params:    []*doc.JSONField{},
+				Results: []*doc.JSONField{
+					{Name: "", Type: "string"},
+				},
+				File: "hello.gno",
+				Line: 7,
+			},
+		},
+		Types: []*doc.JSONType{
+			{
+				Name: "myStruct",
+				Type: "struct{ a int }",
+				Doc:  "myStruct is a struct for testing\n",
+				Kind: "struct",
+				Fields: []*doc.JSONField{
+					{Name: "a", Type: "int", Doc: ""},
+				},
+				File: "hello.gno",
+				Line: 6,
+			},
+		},
+	}
+
+	tt := []struct {
+		input              []byte
+		expectedResult     string
+		expectedErrorMatch string
+	}{
+		// valid queries
+		{input: []byte(`gno.land/r/hello`), expectedResult: expected.JSON()},
+		{input: []byte(`gno.land/r/doesnotexist`), expectedErrorMatch: `invalid package path`},
+	}
+
+	for _, tc := range tt {
+		name := string(tc.input)
+		t.Run(name, func(t *testing.T) {
+			env := setupTestEnv()
+			ctx := env.vmk.MakeGnoTransactionStore(env.ctx)
+			vmHandler := env.vmh
+
+			// Give "addr1" some gnots.
+			addr := crypto.AddressFromPreimage([]byte("addr1"))
+			acc := env.acck.NewAccountWithAddress(ctx, addr)
+			env.acck.SetAccount(ctx, acc)
+			env.bankk.SetCoins(ctx, addr, std.MustParseCoins("10000000ugnot"))
+			assert.True(t, env.bankk.GetCoins(ctx, addr).IsEqual(std.MustParseCoins("10000000ugnot")))
+
+			// Create test package.
+			const pkgpath = "gno.land/r/hello"
+			// Create test package.
+			files := []*std.MemFile{
+				{Name: "gnomod.toml", Body: gnolang.GenGnoModLatest(pkgpath)},
+				{Name: "hello.gno", Body: `
+// hello is a package for testing
+package hello
+
+// myStruct is a struct for testing
+type myStruct struct{a int}
+func (ms myStruct) Foo() string { return "myStruct.Foo" }
+// The prefix for the hello message
+const prefix = "Hello"
+func Hello(msg string) (res string) { res = prefix+" "+msg; return }
+`},
+			}
+			pkgPath := "gno.land/r/hello"
+			msg1 := NewMsgAddPackage(addr, pkgPath, files)
+			err := env.vmk.AddPackage(ctx, msg1)
+			assert.NoError(t, err)
+
+			req := abci.RequestQuery{
+				Path: "vm/qdoc",
+				Data: tc.input,
+			}
+
+			res := vmHandler.Query(env.ctx, req)
+			if tc.expectedErrorMatch == "" {
+				assert.True(t, res.IsOK(), "should not have error")
+				if tc.expectedResult != "" {
+					assert.Equal(t, tc.expectedResult, string(res.Data))
+				}
+			} else {
+				assert.False(t, res.IsOK(), "should have an error")
+				errmsg := res.Error.Error()
+				assert.Regexp(t, tc.expectedErrorMatch, errmsg)
+			}
+		})
+	}
+}
+
+func TestVmHandlerQuery_PkgJSON_NotFound(t *testing.T) {
+	env := setupTestEnv()
+	vmHandler := env.vmh
+
+	req := abci.RequestQuery{
+		Path: "vm/qpkg_json",
+		Data: []byte("gno.land/r/nonexistent/pkg"),
+	}
+
+	res := vmHandler.Query(env.ctx, req)
+	assert.False(t, res.IsOK(), "should have an error")
+	assert.Regexp(t, `invalid package path`, res.Error.Error())
+}
+
+func TestVmHandlerQuery_TypeJSON_NotFound(t *testing.T) {
+	env := setupTestEnv()
+	vmHandler := env.vmh
+
+	req := abci.RequestQuery{
+		Path: "vm/qtype_json",
+		Data: []byte("gno.land/r/nonexistent.FakeType"),
+	}
+
+	res := vmHandler.Query(env.ctx, req)
+	assert.False(t, res.IsOK(), "should have an error")
+	assert.Regexp(t, `invalid expression`, res.Error.Error())
+}
+
+// TestVmHandlerQueryRoutesPackageMeta pins the query wiring for
+// vm/qpkgmeta_json.
+//
+// The keeper method is covered elsewhere, by tests that call it directly -- so
+// nothing there exercises the path string or the switch case. A typo in either
+// leaves those green while the endpoint answers "unknown vm query endpoint".
+//
+// An absent package is the right case to assert on, because it is also where
+// this query differs from every other one: absent is a SUCCESSFUL response
+// carrying a status. A missing route and an absent package must not look alike,
+// which is exactly what this asserts.
+func TestVmHandlerQueryRoutesPackageMeta(t *testing.T) {
+	env := setupTestEnv()
+
+	res := env.vmh.Query(env.ctx, abci.RequestQuery{
+		Path: "vm/qpkgmeta_json",
+		Data: []byte("gno.land/r/nonexistent/pkg"),
+	})
+	require.True(t, res.IsOK(),
+		"an absent package must not be a query error: %v", res.Error)
+
+	var got PackageMeta
+	require.NoError(t, json.Unmarshal(res.Data, &got))
+	assert.Equal(t, "gno.land/r/nonexistent/pkg", got.Path)
+	assert.Equal(t, PackageStatusAbsent, got.Status)
+	assert.False(t, got.Pending)
+}
+
+// TestVmHandlerQueryRoutesInertPaths pins the wiring for vm/qinertpaths.
+//
+// As with qpkgmeta_json, the keeper method is tested directly, so nothing else
+// exercises the path string or the switch case.
+func TestVmHandlerQueryRoutesInertPaths(t *testing.T) {
+	env := setupTestEnv()
+
+	res := env.vmh.Query(env.ctx, abci.RequestQuery{
+		Path: "vm/qinertpaths",
+		Data: []byte(""),
+	})
+	require.True(t, res.IsOK(), "an empty queue is not an error: %v", res.Error)
+	assert.Empty(t, string(res.Data), "nothing is parked in a fresh env")
+
+	// The limit is shared with vm/qpaths, so a bad one must be refused here too.
+	bad := env.vmh.Query(env.ctx, abci.RequestQuery{
+		Path: "vm/qinertpaths?limit=notanumber",
+		Data: []byte(""),
+	})
+	assert.False(t, bad.IsOK(), "an unparseable limit must be refused")
+}
+
+// TestVmHandlerProcessRoutesReject pins that Process dispatches MsgRejectPackage.
+//
+// Without the switch case the message would be accepted by ValidateBasic,
+// admitted by the ante, and then silently rejected as unrecognised.
+func TestVmHandlerProcessRoutesReject(t *testing.T) {
+	env := setupTestEnv()
+	ctx := env.vmk.MakeGnoTransactionStore(env.ctx)
+
+	res := env.vmh.Process(ctx, MsgRejectPackage{
+		Sender:  crypto.AddressFromPreimage([]byte("someone")),
+		PkgPath: "gno.land/r/test/nothingparked",
+	})
+	require.False(t, res.IsOK(), "nothing is parked, so it must fail")
+	assert.Contains(t, res.Error.Error(), "invalid package path",
+		"and fail in the keeper body, not as an unrecognised message type")
+}
+
+// TestVmHandlerProcessRoutesInertMsgs pins that Process dispatches the
+// inert-policy enable message to its keeper method.
+//
+// The keeper method is covered in depth elsewhere; what has no other test is
+// the wiring. handleMsgEnablePackage was only reached through one end-to-end
+// test in another package — so deleting its case from the switch left a
+// message that ValidateBasic accepts, the ante admits, and the VM then silently
+// rejects as "unrecognized vm message type". That is a routing failure reported
+// as a message-type failure, at the point a chain has already committed to the
+// policy.
+//
+// Asserted through the errors the keeper alone produces: "not a pkg approver"
+// and "no inert package at path" can only come from EnablePackage. An unrouted
+// message would instead say "unrecognized", which is what the negative case at
+// the bottom pins.
+func TestVmHandlerProcessRoutesInertMsgs(t *testing.T) {
+	env := setupTestEnv()
+	ctx := env.vmk.MakeGnoTransactionStore(env.ctx)
+	vh := NewHandler(env.vmk)
+
+	approver := crypto.AddressFromPreimage([]byte("oracle"))
+	stranger := crypto.AddressFromPreimage([]byte("stranger"))
+
+	params := DefaultParams()
+	params.CodeSubmissionPolicy = CodeSubmissionPolicyInert
+	params.PkgApprovers = []crypto.Address{approver}
+	require.NoError(t, env.vmk.SetParams(ctx, params))
+
+	t.Run("enable reaches the keeper's approver gate", func(t *testing.T) {
+		res := vh.Process(ctx, MsgEnablePackage{Approver: stranger, PkgPath: "gno.land/r/test/x"})
+		require.False(t, res.IsOK())
+		assert.Contains(t, res.Log, "not a pkg approver")
+		assert.NotContains(t, res.Log, "unrecognized")
+	})
+
+	t.Run("enable reaches the keeper's parked-package lookup", func(t *testing.T) {
+		// An authorized approver gets past the gates and fails on absence,
+		// which only the keeper body can report.
+		res := vh.Process(ctx, MsgEnablePackage{Approver: approver, PkgPath: "gno.land/r/test/nothinghere"})
+		require.False(t, res.IsOK())
+		assert.Contains(t, res.Log, "no inert package at path")
+	})
+
+	t.Run("an unrouted message is distinguishable", func(t *testing.T) {
+		res := vh.Process(ctx, testUnroutedMsg{})
+		require.False(t, res.IsOK())
+		assert.Contains(t, res.Log, "unrecognized vm message type")
+	})
+}
+
+// testUnroutedMsg is a vm-route message Process has no case for, so the
+// "unrecognized" arm above is asserted against a real miss rather than assumed.
+type testUnroutedMsg struct{}
+
+func (testUnroutedMsg) Route() string                           { return RouterKey }
+func (testUnroutedMsg) Type() string                            { return "unrouted" }
+func (testUnroutedMsg) ValidateBasic() error                    { return nil }
+func (testUnroutedMsg) GetSignBytes() []byte                    { return nil }
+func (testUnroutedMsg) GetSigners() []crypto.Address            { return nil }
+func (testUnroutedMsg) GetReceived() std.Coins                  { return nil }
+func (testUnroutedMsg) SpendForSigner(crypto.Address) std.Coins { return nil }

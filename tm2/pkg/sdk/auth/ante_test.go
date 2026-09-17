@@ -1,0 +1,1302 @@
+package auth
+
+import (
+	"fmt"
+	"math"
+	"math/rand"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/gnolang/gno/tm2/pkg/amino"
+	abci "github.com/gnolang/gno/tm2/pkg/bft/abci/types"
+	bft "github.com/gnolang/gno/tm2/pkg/bft/types"
+	"github.com/gnolang/gno/tm2/pkg/crypto"
+	"github.com/gnolang/gno/tm2/pkg/crypto/ed25519"
+	"github.com/gnolang/gno/tm2/pkg/crypto/multisig"
+	"github.com/gnolang/gno/tm2/pkg/crypto/secp256k1"
+	"github.com/gnolang/gno/tm2/pkg/sdk"
+	tu "github.com/gnolang/gno/tm2/pkg/sdk/testutils"
+	"github.com/gnolang/gno/tm2/pkg/std"
+	"github.com/gnolang/gno/tm2/pkg/store"
+)
+
+// run the tx through the anteHandler and ensure its valid
+func checkValidTx(t *testing.T, anteHandler sdk.AnteHandler, ctx sdk.Context, tx std.Tx, simulate bool) {
+	t.Helper()
+
+	_, result, abort := anteHandler(ctx, tx, simulate)
+	require.Equal(t, "", result.Log)
+	require.False(t, abort)
+	require.Nil(t, result.Error)
+	require.True(t, result.IsOK())
+}
+
+// run the tx through the anteHandler and ensure it fails with the given code
+func checkInvalidTx(t *testing.T, anteHandler sdk.AnteHandler, ctx sdk.Context, tx std.Tx, simulate bool, err abci.Error) {
+	t.Helper()
+
+	newCtx, result, abort := anteHandler(ctx, tx, simulate)
+	require.True(t, abort)
+
+	require.Equal(t, reflect.TypeOf(err), reflect.TypeOf(sdk.ABCIError(result.Error)), fmt.Sprintf("Expected %v, got %v", err, result))
+
+	if reflect.TypeOf(err) == reflect.TypeFor[std.OutOfGasError]() {
+		// GasWanted set correctly
+		require.Equal(t, tx.Fee.GasWanted, result.GasWanted, "Gas wanted not set correctly")
+		require.True(t, result.GasUsed > result.GasWanted, "GasUsed not greated than GasWanted")
+		// Check that context is set correctly
+		require.Equal(t, result.GasUsed, newCtx.GasMeter().GasConsumed(), "Context not updated correctly")
+	}
+}
+
+func defaultAnteOptions() AnteOptions {
+	return AnteOptions{
+		VerifyGenesisSignatures: true,
+	}
+}
+
+// Test various error cases in the AnteHandler control flow.
+func TestAnteHandlerSigErrors(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	ctx := env.ctx
+	anteHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+
+	// keys and addresses
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+	priv2, _, addr2 := tu.KeyTestPubAddr()
+	priv3, _, addr3 := tu.KeyTestPubAddr()
+
+	// msg and signatures
+	var tx std.Tx
+	msg1 := tu.NewTestMsg(addr1, addr2)
+	msg2 := tu.NewTestMsg(addr1, addr3)
+	fee := tu.NewTestFee()
+
+	msgs := []std.Msg{msg1, msg2}
+
+	// test no signatures
+	privs, accNums, seqs := []crypto.PrivKey{}, []uint64{}, []uint64{}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accNums, seqs, fee)
+
+	// tx.GetSigners returns addresses in correct order: addr1, addr2, addr3
+	expectedSigners := []crypto.Address{addr1, addr2, addr3}
+	require.Equal(t, expectedSigners, tx.GetSigners())
+
+	// Check no signatures fails
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.NoSignaturesError{})
+
+	// test num sigs dont match GetSigners
+	privs, accNums, seqs = []crypto.PrivKey{priv1}, []uint64{0}, []uint64{0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accNums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnauthorizedError{})
+
+	// test an unrecognized account
+	privs, accNums, seqs = []crypto.PrivKey{priv1, priv2, priv3}, []uint64{0, 1, 2}, []uint64{0, 0, 0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accNums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnknownAddressError{})
+
+	// save the first account, but second is still unrecognized
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	acc1.SetCoins(std.Coins{fee.GasFee})
+	env.acck.SetAccount(ctx, acc1)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnknownAddressError{})
+}
+
+// Test logic around account number checking with one signer and many signers.
+func TestAnteHandlerAccountNumbers(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	anteHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+	ctx := env.ctx
+
+	// keys and addresses
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+	priv2, _, addr2 := tu.KeyTestPubAddr()
+
+	// set the accounts
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	acc1.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc1.SetAccountNumber(0))
+	env.acck.SetAccount(ctx, acc1)
+	acc2 := env.acck.NewAccountWithAddress(ctx, addr2)
+	acc2.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc2.SetAccountNumber(1))
+	env.acck.SetAccount(ctx, acc2)
+
+	// msg and signatures
+	var tx std.Tx
+	msg := tu.NewTestMsg(addr1)
+	fee := tu.NewTestFee()
+
+	msgs := []std.Msg{msg}
+
+	// test good tx from one signer
+	privs, accnums, seqs := []crypto.PrivKey{priv1}, []uint64{0}, []uint64{0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	// new tx from wrong account number
+	seqs = []uint64{1}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, []uint64{1}, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnauthorizedError{})
+
+	// from correct account number
+	seqs = []uint64{1}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, []uint64{0}, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	// new tx with another signer and incorrect account numbers
+	msg1 := tu.NewTestMsg(addr1, addr2)
+	msg2 := tu.NewTestMsg(addr2, addr1)
+	msgs = []std.Msg{msg1, msg2}
+	privs, accnums, seqs = []crypto.PrivKey{priv1, priv2}, []uint64{1, 0}, []uint64{2, 0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnauthorizedError{})
+
+	// correct account numbers
+	privs, accnums, seqs = []crypto.PrivKey{priv1, priv2}, []uint64{0, 1}, []uint64{2, 0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+}
+
+// Test logic around account number checking with many signers when BlockHeight is 0.
+func TestAnteHandlerAccountNumbersAtBlockHeightZero(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	anteHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+	ctx := env.ctx
+	header := ctx.BlockHeader().(*bft.Header)
+	header.Height = 0
+	ctx = ctx.WithBlockHeader(header)
+
+	// keys and addresses
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+	priv2, _, addr2 := tu.KeyTestPubAddr()
+
+	// set the accounts, we don't need the acc numbers as it is in the genesis block
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	acc1.SetCoins(tu.NewTestCoins())
+	env.acck.SetAccount(ctx, acc1)
+	acc2 := env.acck.NewAccountWithAddress(ctx, addr2)
+	acc2.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc2.SetAccountNumber(1))
+	env.acck.SetAccount(ctx, acc2)
+
+	// msg and signatures
+	var tx std.Tx
+	msg := tu.NewTestMsg(addr1)
+	fee := tu.NewTestFee()
+
+	msgs := []std.Msg{msg}
+
+	// test good tx from one signer
+	privs, accnums, seqs := []crypto.PrivKey{priv1}, []uint64{0}, []uint64{0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	// new tx from wrong account number
+	seqs = []uint64{1}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, []uint64{1}, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnauthorizedError{})
+
+	// At genesis account number is zero
+	seqs = []uint64{0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, []uint64{0}, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	// new tx with another signer and incorrect account numbers
+	msg1 := tu.NewTestMsg(addr1, addr2)
+	msg2 := tu.NewTestMsg(addr2, addr1)
+	msgs = []std.Msg{msg1, msg2}
+	privs, accnums, seqs = []crypto.PrivKey{priv1, priv2}, []uint64{1, 0}, []uint64{2, 0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnauthorizedError{})
+
+	// correct account numbers
+	privs, accnums, seqs = []crypto.PrivKey{priv1, priv2}, []uint64{0, 0}, []uint64{0, 0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+}
+
+// Test logic around sequence checking with one signer and many signers.
+func TestAnteHandlerSequences(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	anteHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+	ctx := env.ctx
+
+	// keys and addresses
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+	priv2, _, addr2 := tu.KeyTestPubAddr()
+	priv3, _, addr3 := tu.KeyTestPubAddr()
+
+	// set the accounts
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	acc1.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc1.SetAccountNumber(0))
+	env.acck.SetAccount(ctx, acc1)
+	acc2 := env.acck.NewAccountWithAddress(ctx, addr2)
+	acc2.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc2.SetAccountNumber(1))
+	env.acck.SetAccount(ctx, acc2)
+	acc3 := env.acck.NewAccountWithAddress(ctx, addr3)
+	acc3.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc3.SetAccountNumber(2))
+	env.acck.SetAccount(ctx, acc3)
+
+	// msg and signatures
+	var tx std.Tx
+	msg := tu.NewTestMsg(addr1)
+	fee := tu.NewTestFee()
+
+	msgs := []std.Msg{msg}
+
+	// test good tx from one signer
+	privs, accnums, seqs := []crypto.PrivKey{priv1}, []uint64{0}, []uint64{0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	// test sending it again fails (replay protection)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnauthorizedError{})
+
+	// fix sequence, should pass
+	seqs = []uint64{1}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	// new tx with another signer and correct sequences
+	msg1 := tu.NewTestMsg(addr1, addr2)
+	msg2 := tu.NewTestMsg(addr3, addr1)
+	msgs = []std.Msg{msg1, msg2}
+
+	privs, accnums, seqs = []crypto.PrivKey{priv1, priv2, priv3}, []uint64{0, 1, 2}, []uint64{2, 0, 0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	// replay fails
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnauthorizedError{})
+
+	// tx from just second signer with incorrect sequence fails
+	msg = tu.NewTestMsg(addr2)
+	msgs = []std.Msg{msg}
+	privs, accnums, seqs = []crypto.PrivKey{priv2}, []uint64{1}, []uint64{0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnauthorizedError{})
+
+	// fix the sequence and it passes
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, []crypto.PrivKey{priv2}, []uint64{1}, []uint64{1}, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	// another tx from both of them that passes
+	msg = tu.NewTestMsg(addr1, addr2)
+	msgs = []std.Msg{msg}
+	privs, accnums, seqs = []crypto.PrivKey{priv1, priv2}, []uint64{0, 1}, []uint64{3, 2}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+}
+
+// Test logic around fee deduction.
+func TestAnteHandlerFees(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	ctx := env.ctx
+	anteHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+
+	// keys and addresses
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+
+	// set the accounts
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	env.acck.SetAccount(ctx, acc1)
+
+	// msg and signatures
+	var tx std.Tx
+	msg := tu.NewTestMsg(addr1)
+	privs, accnums, seqs := []crypto.PrivKey{priv1}, []uint64{0}, []uint64{0}
+	fee := tu.NewTestFee()
+	msgs := []std.Msg{msg}
+
+	// signer does not have enough funds to pay the fee
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.InsufficientFundsError{})
+
+	feeCollector := env.acck.FeeCollectorAddress(ctx)
+
+	acc1.SetCoins(std.NewCoins(std.NewCoin("atom", 149)))
+	env.acck.SetAccount(ctx, acc1)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.InsufficientFundsError{})
+
+	collector := env.bankk.(DummyBankKeeper).acck.GetAccount(ctx, feeCollector)
+	require.Nil(t, collector)
+	require.Equal(t, env.acck.GetAccount(ctx, addr1).GetCoins().AmountOf("atom"), int64(149))
+
+	acc1.SetCoins(std.NewCoins(std.NewCoin("atom", 150)))
+	env.acck.SetAccount(ctx, acc1)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	require.Equal(t, env.bankk.(DummyBankKeeper).acck.GetAccount(ctx, feeCollector).GetCoins().AmountOf("atom"), int64(150))
+	require.Equal(t, env.acck.GetAccount(ctx, addr1).GetCoins().AmountOf("atom"), int64(0))
+}
+
+// Test logic around memo gas consumption.
+func TestAnteHandlerMemoGas(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	anteHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+	ctx := env.ctx
+
+	// keys and addresses
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+
+	// set the accounts
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	require.NoError(t, acc1.SetAccountNumber(0))
+	env.acck.SetAccount(ctx, acc1)
+
+	// msg and signatures
+	var tx std.Tx
+	msg := tu.NewTestMsg(addr1)
+	privs, accnums, seqs := []crypto.PrivKey{priv1}, []uint64{0}, []uint64{0}
+	fee := std.NewFee(0, std.NewCoin("atom", 0))
+
+	// tx does not have enough gas
+	tx = tu.NewTestTx(t, ctx.ChainID(), []std.Msg{msg}, privs, accnums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.OutOfGasError{})
+
+	// tx with memo doesn't have enough gas
+	fee = std.NewFee(801, std.NewCoin("atom", 0))
+	tx = tu.NewTestTxWithMemo(t, ctx.ChainID(), []std.Msg{msg}, privs, accnums, seqs, fee, "abcininasidniandsinasindiansdiansdinaisndiasndiadninsd")
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.OutOfGasError{})
+
+	// memo too large
+	fee = std.NewFee(9000, std.NewCoin("atom", 0))
+	tx = tu.NewTestTxWithMemo(t, ctx.ChainID(), []std.Msg{msg}, privs, accnums, seqs, fee, strings.Repeat("01234567890", 99000))
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.MemoTooLargeError{})
+
+	// tx with memo has enough gas
+	fee = std.NewFee(9000, std.NewCoin("atom", 0))
+	tx = tu.NewTestTxWithMemo(t, ctx.ChainID(), []std.Msg{msg}, privs, accnums, seqs, fee, strings.Repeat("0123456789", 10))
+	checkValidTx(t, anteHandler, ctx, tx, false)
+}
+
+func TestAnteHandlerMultiSigner(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	anteHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+	ctx := env.ctx
+
+	// keys and addresses
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+	priv2, _, addr2 := tu.KeyTestPubAddr()
+	priv3, _, addr3 := tu.KeyTestPubAddr()
+
+	// set the accounts
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	acc1.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc1.SetAccountNumber(0))
+	env.acck.SetAccount(ctx, acc1)
+	acc2 := env.acck.NewAccountWithAddress(ctx, addr2)
+	acc2.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc2.SetAccountNumber(1))
+	env.acck.SetAccount(ctx, acc2)
+	acc3 := env.acck.NewAccountWithAddress(ctx, addr3)
+	acc3.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc3.SetAccountNumber(2))
+	env.acck.SetAccount(ctx, acc3)
+
+	// set up msgs and fee
+	var tx std.Tx
+	msg1 := tu.NewTestMsg(addr1, addr2)
+	msg2 := tu.NewTestMsg(addr3, addr1)
+	msg3 := tu.NewTestMsg(addr2, addr3)
+	msgs := []std.Msg{msg1, msg2, msg3}
+	fee := tu.NewTestFee()
+
+	// signers in order
+	privs, accnums, seqs := []crypto.PrivKey{priv1, priv2, priv3}, []uint64{0, 1, 2}, []uint64{0, 0, 0}
+	tx = tu.NewTestTxWithMemo(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee, "Check signers are in expected order and different account numbers works")
+
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	// change sequence numbers
+	tx = tu.NewTestTx(t, ctx.ChainID(), []std.Msg{msg1}, []crypto.PrivKey{priv1, priv2}, []uint64{0, 1}, []uint64{1, 1}, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+	tx = tu.NewTestTx(t, ctx.ChainID(), []std.Msg{msg2}, []crypto.PrivKey{priv3, priv1}, []uint64{2, 0}, []uint64{1, 2}, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	// expected seqs = [3, 2, 2]
+	tx = tu.NewTestTxWithMemo(t, ctx.ChainID(), msgs, privs, accnums, []uint64{3, 2, 2}, fee, "Check signers are in expected order and different account numbers and sequence numbers works")
+	checkValidTx(t, anteHandler, ctx, tx, false)
+}
+
+func TestAnteHandlerBadSignBytes(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	anteHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+	ctx := env.ctx
+
+	// keys and addresses
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+	priv2, _, addr2 := tu.KeyTestPubAddr()
+
+	// set the accounts
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	acc1.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc1.SetAccountNumber(0))
+	env.acck.SetAccount(ctx, acc1)
+	acc2 := env.acck.NewAccountWithAddress(ctx, addr2)
+	acc2.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc2.SetAccountNumber(1))
+	env.acck.SetAccount(ctx, acc2)
+
+	var tx std.Tx
+	msg := tu.NewTestMsg(addr1)
+	msgs := []std.Msg{msg}
+	fee := tu.NewTestFee()
+	fee2 := tu.NewTestFee()
+	fee2.GasWanted += 100
+	fee3 := tu.NewTestFee()
+	fee3.GasFee.Amount += 100
+
+	// test good tx and signBytes
+	privs, accnums, seqs := []crypto.PrivKey{priv1}, []uint64{0}, []uint64{0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	chainID := ctx.ChainID()
+	chainID2 := chainID + "somemorestuff"
+	unauthErr := std.UnauthorizedError{}
+
+	cases := []struct {
+		chainID string
+		accnum  uint64
+		seq     uint64
+		fee     std.Fee
+		msgs    []std.Msg
+		err     abci.Error
+	}{
+		{chainID2, 0, 1, fee, msgs, unauthErr},                           // test wrong chain_id
+		{chainID, 0, 2, fee, msgs, unauthErr},                            // test wrong seqs
+		{chainID, 1, 1, fee, msgs, unauthErr},                            // test wrong accnum
+		{chainID, 0, 1, fee, []std.Msg{tu.NewTestMsg(addr2)}, unauthErr}, // test wrong msg
+		{chainID, 0, 1, fee2, msgs, unauthErr},                           // test wrong fee
+		{chainID, 0, 1, fee3, msgs, unauthErr},                           // test wrong fee
+	}
+
+	for _, cs := range cases {
+		signPayload, err := std.GetSignaturePayload(std.SignDoc{
+			ChainID:       cs.chainID,
+			AccountNumber: cs.accnum,
+			Sequence:      cs.seq,
+			Fee:           cs.fee,
+			Msgs:          cs.msgs,
+		})
+		require.NoError(t, err)
+
+		tx := tu.NewTestTxWithSignBytes(
+			msgs, privs, fee,
+			signPayload,
+			"",
+		)
+		checkInvalidTx(t, anteHandler, ctx, tx, false, cs.err)
+	}
+
+	// test wrong signer if public key exist
+	privs, accnums, seqs = []crypto.PrivKey{priv2}, []uint64{0}, []uint64{1}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.UnauthorizedError{})
+
+	// test wrong signer if public doesn't exist
+	msg = tu.NewTestMsg(addr2)
+	msgs = []std.Msg{msg}
+	privs, accnums, seqs = []crypto.PrivKey{priv1}, []uint64{1}, []uint64{0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.InvalidPubKeyError{})
+}
+
+func TestAnteHandlerSetPubKey(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	anteHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+	ctx := env.ctx
+
+	// keys and addresses
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+	_, _, addr2 := tu.KeyTestPubAddr()
+
+	// set the accounts
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	acc1.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc1.SetAccountNumber(0))
+	env.acck.SetAccount(ctx, acc1)
+	acc2 := env.acck.NewAccountWithAddress(ctx, addr2)
+	acc2.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc2.SetAccountNumber(1))
+	env.acck.SetAccount(ctx, acc2)
+
+	var tx std.Tx
+
+	// test good tx and set public key
+	msg := tu.NewTestMsg(addr1)
+	msgs := []std.Msg{msg}
+	privs, accnums, seqs := []crypto.PrivKey{priv1}, []uint64{0}, []uint64{0}
+	fee := tu.NewTestFee()
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+
+	acc1 = env.acck.GetAccount(ctx, addr1)
+	require.Equal(t, acc1.GetPubKey(), priv1.PubKey())
+
+	// test public key not found
+	msg = tu.NewTestMsg(addr2)
+	msgs = []std.Msg{msg}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, []uint64{1}, seqs, fee)
+	sigs := tx.GetSignatures()
+	sigs[0].PubKey = nil
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.InvalidPubKeyError{})
+
+	acc2 = env.acck.GetAccount(ctx, addr2)
+	require.Nil(t, acc2.GetPubKey())
+
+	// test invalid signature and public key
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, []uint64{1}, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.InvalidPubKeyError{})
+
+	acc2 = env.acck.GetAccount(ctx, addr2)
+	require.Nil(t, acc2.GetPubKey())
+}
+
+func TestConsumeSignatureVerificationGas(t *testing.T) {
+	t.Parallel()
+
+	params := DefaultParams()
+	msg := []byte{1, 2, 3, 4}
+
+	pkSet1, sigSet1 := generatePubKeysAndSignatures(5, msg, false)
+	multisigKey1 := multisig.NewPubKeyMultisigThreshold(2, pkSet1)
+	multisignature1 := multisig.NewMultisig(len(pkSet1))
+	expectedCost1 := expectedGasCostByKeys(pkSet1)
+	for i := range pkSet1 {
+		multisignature1.AddSignatureFromPubKey(sigSet1[i], pkSet1[i], pkSet1)
+	}
+
+	type args struct {
+		meter  store.GasMeter
+		sig    []byte
+		pubkey crypto.PubKey
+		params Params
+	}
+	tests := []struct {
+		name        string
+		args        args
+		gasConsumed int64
+		shouldErr   bool
+	}{
+		{"PubKeyEd25519", args{store.NewInfiniteGasMeter(), nil, ed25519.GenPrivKey().PubKey(), params}, DefaultSigVerifyCostED25519, false},
+		{"PubKeySecp256k1", args{store.NewInfiniteGasMeter(), nil, secp256k1.GenPrivKey().PubKey(), params}, DefaultSigVerifyCostSecp256k1, false},
+		{"Multisig", args{store.NewInfiniteGasMeter(), amino.MustMarshal(multisignature1), multisigKey1, params}, expectedCost1, false},
+		{"unknown key", args{store.NewInfiniteGasMeter(), nil, nil, params}, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			res := DefaultSigVerificationGasConsumer(tt.args.meter, tt.args.sig, tt.args.pubkey, tt.args.params)
+
+			if tt.shouldErr {
+				require.False(t, res.IsOK())
+			} else {
+				require.True(t, res.IsOK())
+				require.Equal(t, tt.gasConsumed, tt.args.meter.GasConsumed(), fmt.Sprintf("%d != %d", tt.gasConsumed, tt.args.meter.GasConsumed()))
+			}
+		})
+	}
+}
+
+func generatePubKeysAndSignatures(n int, msg []byte, keyTypeed25519 bool) (pubkeys []crypto.PubKey, signatures [][]byte) {
+	pubkeys = make([]crypto.PubKey, n)
+	signatures = make([][]byte, n)
+	for i := range n {
+		var privkey crypto.PrivKey
+		if rand.Int63()%2 == 0 {
+			privkey = ed25519.GenPrivKey()
+		} else {
+			privkey = secp256k1.GenPrivKey()
+		}
+		pubkeys[i] = privkey.PubKey()
+		signatures[i], _ = privkey.Sign(msg)
+	}
+	return
+}
+
+func expectedGasCostByKeys(pubkeys []crypto.PubKey) int64 {
+	cost := int64(0)
+	for _, pubkey := range pubkeys {
+		pubkeyType := strings.ToLower(fmt.Sprintf("%T", pubkey))
+		switch {
+		case strings.Contains(pubkeyType, "ed25519"):
+			cost += DefaultParams().SigVerifyCostED25519
+		case strings.Contains(pubkeyType, "secp256k1"):
+			cost += DefaultParams().SigVerifyCostSecp256k1
+		default:
+			panic("unexpected key type")
+		}
+	}
+	return cost
+}
+
+func TestCountSubkeys(t *testing.T) {
+	t.Parallel()
+
+	genPubKeys := func(n int) []crypto.PubKey {
+		var ret []crypto.PubKey
+		for range n {
+			ret = append(ret, secp256k1.GenPrivKey().PubKey())
+		}
+		return ret
+	}
+	singleKey := secp256k1.GenPrivKey().PubKey()
+	singleLevelMultiKey := multisig.NewPubKeyMultisigThreshold(4, genPubKeys(5))
+	multiLevelSubKey1 := multisig.NewPubKeyMultisigThreshold(4, genPubKeys(5))
+	multiLevelSubKey2 := multisig.NewPubKeyMultisigThreshold(4, genPubKeys(5))
+	multiLevelMultiKey := multisig.NewPubKeyMultisigThreshold(2, []crypto.PubKey{
+		multiLevelSubKey1, multiLevelSubKey2, secp256k1.GenPrivKey().PubKey(),
+	})
+	type args struct {
+		pub crypto.PubKey
+	}
+	tests := []struct {
+		name string
+		args args
+		want int
+	}{
+		{"single key", args{singleKey}, 1},
+		{"single level multikey", args{singleLevelMultiKey}, 5},
+		{"multi level multikey", args{multiLevelMultiKey}, 11},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tt.want, std.CountSubKeys(tt.args.pub))
+		})
+	}
+}
+
+func TestAnteHandlerSigLimitExceeded(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	anteHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+	ctx := env.ctx
+
+	// keys and addresses
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+	priv2, _, addr2 := tu.KeyTestPubAddr()
+	priv3, _, addr3 := tu.KeyTestPubAddr()
+	priv4, _, addr4 := tu.KeyTestPubAddr()
+	priv5, _, addr5 := tu.KeyTestPubAddr()
+	priv6, _, addr6 := tu.KeyTestPubAddr()
+	priv7, _, addr7 := tu.KeyTestPubAddr()
+	priv8, _, addr8 := tu.KeyTestPubAddr()
+
+	// set the accounts
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	acc1.SetCoins(tu.NewTestCoins())
+	env.acck.SetAccount(ctx, acc1)
+	acc2 := env.acck.NewAccountWithAddress(ctx, addr2)
+	acc2.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc2.SetAccountNumber(1))
+	env.acck.SetAccount(ctx, acc2)
+
+	var tx std.Tx
+	msg := tu.NewTestMsg(addr1, addr2, addr3, addr4, addr5, addr6, addr7, addr8)
+	msgs := []std.Msg{msg}
+	fee := tu.NewTestFee()
+
+	// test rejection logic
+	privs, accnums, seqs := []crypto.PrivKey{priv1, priv2, priv3, priv4, priv5, priv6, priv7, priv8},
+		[]uint64{0, 0, 0, 0, 0, 0, 0, 0}, []uint64{0, 0, 0, 0, 0, 0, 0, 0}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.TooManySignaturesError{})
+}
+
+func TestEnsureSufficientMempoolFees(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	ctx := env.ctx.WithMinGasPrices(
+		[]std.GasPrice{
+			{Gas: 100000, Price: std.Coin{Denom: "photino", Amount: 5}},
+			{Gas: 100000, Price: std.Coin{Denom: "stake", Amount: 1}},
+		},
+	)
+
+	testCases := []struct {
+		input      std.Fee
+		expectedOK bool
+	}{
+		{std.NewFee(200000, std.Coin{}), false},
+		{std.NewFee(200000, std.NewCoin("photino", 5)), false},
+		{std.NewFee(200000, std.NewCoin("stake", 1)), false},
+		{std.NewFee(200000, std.NewCoin("stake", 2)), true},
+		{std.NewFee(200000, std.NewCoin("photino", 10)), true},
+		{std.NewFee(200000, std.NewCoin("stake", 2)), true},
+		{std.NewFee(200000, std.NewCoin("atom", 5)), false},
+	}
+	// Do not set the block gas price
+	ctx = ctx.WithValue(GasPriceContextKey{}, std.GasPrice{})
+
+	for i, tc := range testCases {
+		res := EnsureSufficientMempoolFees(ctx, tc.input)
+		require.Equal(
+			t, tc.expectedOK, res.IsOK(),
+			"unexpected result; tc #%d, input: %v, log: %v", i, tc.input, res.Log,
+		)
+	}
+}
+
+// Test custom SignatureVerificationGasConsumer
+func TestCustomSignatureVerificationGasConsumer(t *testing.T) {
+	t.Parallel()
+
+	// setup
+	env := setupTestEnv()
+	// setup an ante handler that only accepts PubKeyEd25519
+	anteHandler := NewAnteHandler(env.acck, env.bankk, func(meter store.GasMeter, sig []byte, pubkey crypto.PubKey, params Params) sdk.Result {
+		switch pubkey := pubkey.(type) {
+		case ed25519.PubKeyEd25519:
+			meter.ConsumeGas(params.SigVerifyCostED25519, "ante verify: ed25519")
+			return sdk.Result{}
+		default:
+			return abciResult(std.ErrInvalidPubKey(fmt.Sprintf("unrecognized public key type: %T", pubkey)))
+		}
+	}, defaultAnteOptions())
+	ctx := env.ctx
+
+	// verify that an secp256k1 account gets rejected
+	priv1, _, addr1 := tu.KeyTestPubAddr()
+	acc1 := env.acck.NewAccountWithAddress(ctx, addr1)
+	_ = acc1.SetCoins(std.NewCoins(std.NewCoin("atom", 150)))
+	env.acck.SetAccount(ctx, acc1)
+
+	var tx std.Tx
+	msg := tu.NewTestMsg(addr1)
+	privs, accnums, seqs := []crypto.PrivKey{priv1}, []uint64{0}, []uint64{0}
+	fee := tu.NewTestFee()
+	msgs := []std.Msg{msg}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkInvalidTx(t, anteHandler, ctx, tx, false, std.InvalidPubKeyError{})
+
+	// verify that an ed25519 account gets accepted
+	priv2 := ed25519.GenPrivKey()
+	pub2 := priv2.PubKey()
+	addr2 := pub2.Address()
+	acc2 := env.acck.NewAccountWithAddress(ctx, addr2)
+	require.NoError(t, acc2.SetCoins(std.NewCoins(std.NewCoin("atom", 150))))
+	require.NoError(t, acc2.SetAccountNumber(1))
+	env.acck.SetAccount(ctx, acc2)
+	msg = tu.NewTestMsg(addr2)
+	privs, accnums, seqs = []crypto.PrivKey{priv2}, []uint64{1}, []uint64{0}
+	fee = tu.NewTestFee()
+	msgs = []std.Msg{msg}
+	tx = tu.NewTestTx(t, ctx.ChainID(), msgs, privs, accnums, seqs, fee)
+	checkValidTx(t, anteHandler, ctx, tx, false)
+}
+
+func TestEnsureBlockGasPrice(t *testing.T) {
+	p1, err := std.ParseGasPrice("3ugnot/10gas") // 0.3ugnot
+	require.NoError(t, err)
+
+	p2, err := std.ParseGasPrice("400ugnot/2000gas") // 0.2ugnot
+	require.NoError(t, err)
+
+	userFeeCases := []struct {
+		minGasPrice   std.GasPrice
+		blockGasPrice std.GasPrice
+		input         std.Fee
+		expectedOK    bool
+	}{
+		// user's gas wanted and gas fee: 0.1ugnot to 0.5ugnot
+		// validator's minGasPrice: 0.3 ugnot
+		// block gas price: 0.2ugnot
+
+		{p1, p2, std.NewFee(100, std.NewCoin("ugnot", 10)), false},
+		{p1, p2, std.NewFee(100, std.NewCoin("ugnot", 20)), false},
+		{p1, p2, std.NewFee(100, std.NewCoin("ugnot", 30)), true},
+		{p1, p2, std.NewFee(100, std.NewCoin("ugnot", 40)), true},
+		{p1, p2, std.NewFee(100, std.NewCoin("ugnot", 50)), true},
+
+		// validator's minGasPrice: 0.2 ugnot
+		// block gas price2: 0.3ugnot
+		{p2, p1, std.NewFee(100, std.NewCoin("ugnot", 10)), false},
+		{p2, p1, std.NewFee(100, std.NewCoin("ugnot", 20)), false},
+		{p2, p1, std.NewFee(100, std.NewCoin("ugnot", 30)), true},
+		{p2, p1, std.NewFee(100, std.NewCoin("ugnot", 40)), true},
+		{p2, p1, std.NewFee(100, std.NewCoin("ugnot", 50)), true},
+	}
+
+	// setup
+	env := setupTestEnv()
+	ctx := env.ctx
+	// validator min gas price // 0.3 ugnot per gas
+	for i, c := range userFeeCases {
+		ctx = ctx.WithMinGasPrices(
+			[]std.GasPrice{c.minGasPrice},
+		)
+		ctx = ctx.WithValue(GasPriceContextKey{}, c.blockGasPrice)
+
+		res := EnsureSufficientMempoolFees(ctx, c.input)
+		require.Equal(
+			t, c.expectedOK, res.IsOK(),
+			"unexpected result; case #%d, input: %v, log: %v", i, c.input, res.Log,
+		)
+	}
+}
+
+func TestInvalidUserFee(t *testing.T) {
+	minGasPrice, err := std.ParseGasPrice("3ugnot/10gas") // 0.3ugnot
+	require.NoError(t, err)
+
+	blockGasPrice, err := std.ParseGasPrice("400ugnot/2000gas") // 0.2ugnot
+	require.NoError(t, err)
+
+	userFee1 := std.NewFee(0, std.NewCoin("ugnot", 50))
+	userFee2 := std.NewFee(100, std.NewCoin("uatom", 50))
+
+	// setup
+	env := setupTestEnv()
+	ctx := env.ctx
+
+	ctx = ctx.WithMinGasPrices(
+		[]std.GasPrice{minGasPrice},
+	)
+	ctx = ctx.WithValue(GasPriceContextKey{}, blockGasPrice)
+	res1 := EnsureSufficientMempoolFees(ctx, userFee1)
+	require.False(t, res1.IsOK())
+	assert.Contains(t, res1.Log, "GasPrice.Gas cannot be zero;")
+
+	res2 := EnsureSufficientMempoolFees(ctx, userFee2)
+	require.False(t, res2.IsOK())
+	assert.Contains(t, res2.Log, "Gas price denominations should be equal;")
+}
+
+// TestSetGasMeter_SkipGasMeteringKey verifies that setting the
+// SkipGasMeteringKey context value causes SetGasMeter to return an infinite
+// gas meter, even for non-genesis heights. Used by gnoland's
+// GasReplayMode="source" to preserve source-chain outcomes during hardfork
+// replay.
+func TestSetGasMeter_SkipGasMeteringKey(t *testing.T) {
+	t.Parallel()
+
+	env := setupTestEnv()
+	ctx := env.ctx // default height 1 (not genesis)
+
+	t.Run("default meters gas", func(t *testing.T) {
+		t.Parallel()
+		got := SetGasMeter(ctx, 1000)
+		// Bounded meter: consuming >1000 should panic.
+		require.Panics(t, func() {
+			got.GasMeter().ConsumeGas(2000, "test")
+		})
+	})
+
+	t.Run("SkipGasMeteringKey yields infinite meter", func(t *testing.T) {
+		t.Parallel()
+		skipCtx := ctx.WithValue(SkipGasMeteringKey{}, true)
+		got := SetGasMeter(skipCtx, 1000)
+		// Infinite meter: should handle consumption way beyond gasLimit.
+		require.NotPanics(t, func() {
+			got.GasMeter().ConsumeGas(1_000_000_000, "test")
+		})
+	})
+
+	t.Run("SkipGasMeteringKey=false uses bounded meter", func(t *testing.T) {
+		t.Parallel()
+		noSkipCtx := ctx.WithValue(SkipGasMeteringKey{}, false)
+		got := SetGasMeter(noSkipCtx, 1000)
+		require.Panics(t, func() {
+			got.GasMeter().ConsumeGas(2000, "test")
+		})
+	})
+
+	t.Run("genesis height stays infinite regardless of key", func(t *testing.T) {
+		t.Parallel()
+		header := ctx.BlockHeader().(*bft.Header)
+		header.Height = 0
+		genCtx := ctx.WithBlockHeader(header)
+		got := SetGasMeter(genCtx, 1000)
+		require.NotPanics(t, func() {
+			got.GasMeter().ConsumeGas(10_000_000, "test")
+		})
+	})
+}
+
+// TestAnteHandlerGenesisReplaySkip verifies the genesis-replay signature
+// skip: a tx whose signature no longer matches its body (as happens to a
+// --patch-txs-rewritten historical tx) is skipped ONLY when the node ran
+// with --skip-genesis-sig-verification (VerifyGenesisSignatures == false)
+// AND the ctx carries GenesisReplayKey{}. Neither alone bypasses
+// verification, so a normally-configured node (flag unset) always verifies.
+func TestAnteHandlerGenesisReplaySkip(t *testing.T) {
+	t.Parallel()
+
+	env := setupTestEnv()
+	// Non-genesis block height: the BlockHeight()==0 gate does not apply,
+	// mirroring a historical/patched replay tx whose height is overridden > 0.
+	ctx := env.ctx
+	header := ctx.BlockHeader().(*bft.Header)
+	header.Height = 100
+	ctx = ctx.WithBlockHeader(header)
+
+	priv, _, addr := tu.KeyTestPubAddr()
+	acc := env.acck.NewAccountWithAddress(ctx, addr)
+	acc.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc.SetAccountNumber(0))
+	env.acck.SetAccount(ctx, acc)
+
+	// Sign over the WRONG sequence (99) so the signature won't verify
+	// against the tx as reconstructed at the ante (sequence 0) — mirrors
+	// the invalidation a --patch-txs body rewrite causes.
+	msg := tu.NewTestMsg(addr)
+	fee := tu.NewTestFee()
+	signPayload, err := std.GetSignaturePayload(std.SignDoc{
+		ChainID:       ctx.ChainID(),
+		AccountNumber: 0,
+		Sequence:      99,
+		Fee:           fee,
+		Msgs:          []std.Msg{msg},
+	})
+	require.NoError(t, err)
+	tx := tu.NewTestTxWithSignBytes([]std.Msg{msg}, []crypto.PrivKey{priv}, fee, signPayload, "")
+
+	ctxReplay := ctx.WithValue(GenesisReplayKey{}, true)
+
+	// flag OFF (VerifyGenesisSignatures=true): the replay key is present
+	// but the operator did not opt in — signature is verified and rejected.
+	verifyHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, defaultAnteOptions())
+	checkInvalidTx(t, verifyHandler, ctxReplay, tx, false, std.UnauthorizedError{})
+
+	// flag ON (VerifyGenesisSignatures=false) but WITHOUT the replay key:
+	// not a replay tx, so it is still verified and rejected.
+	skipHandler := NewAnteHandler(env.acck, env.bankk, DefaultSigVerificationGasConsumer, AnteOptions{VerifyGenesisSignatures: false})
+	checkInvalidTx(t, skipHandler, ctx, tx, false, std.UnauthorizedError{})
+
+	// flag ON AND replay key set: signature verification is skipped.
+	checkValidTx(t, skipHandler, ctxReplay, tx, false)
+
+	// flag OFF and no replay key (a fully normal node): the feature is
+	// inert — the invalid signature is verified and rejected.
+	checkInvalidTx(t, verifyHandler, ctx, tx, false, std.UnauthorizedError{})
+}
+
+// splitTierBank reports a balance the account object does not carry, which is what
+// a fee denom looks like once non-gas balances live in their own store keys.
+//
+// This package's DummyBankKeeper keeps every balance in the account object, so
+// with it DeductFees reading through the bank cannot be told apart from reading
+// acc.GetCoins() directly: reverting the fee check to the account object passes
+// this whole package and fails only in gno.land, where fixtures happen to pay
+// fees in atom. That is what this stub exists to close.
+type splitTierBank struct {
+	BankKeeperI
+	denom  string
+	amount int64
+	sent   std.Coins
+}
+
+func (b *splitTierBank) GetCoin(_ sdk.Context, _ crypto.Address, denom string) int64 {
+	if denom == b.denom {
+		return b.amount
+	}
+	return 0
+}
+
+func (b *splitTierBank) SendCoinsUnrestricted(_ sdk.Context, _, _ crypto.Address, amt std.Coins) error {
+	b.sent = amt
+	return nil
+}
+
+// TestDeductFeesReadsTheBankNotTheAccountObject pins the reason BankKeeperI needs
+// GetCoin at all: the fee denom is whatever the transaction names, and a balance
+// for it need not be in the account object.
+func TestDeductFeesReadsTheBankNotTheAccountObject(t *testing.T) {
+	t.Parallel()
+
+	env := setupTestEnv()
+	ctx := env.ctx
+	addr := crypto.AddressFromPreimage([]byte("fee-payer"))
+	acc := env.acck.NewAccountWithAddress(ctx, addr)
+	env.acck.SetAccount(ctx, acc)
+	collector := crypto.AddressFromPreimage([]byte("fee-collector"))
+	fees := std.Coins{{Denom: "atom", Amount: 150}}
+
+	require.Zero(t, acc.GetCoins().AmountOf("atom"),
+		"precondition: the account object must carry none of the fee denom")
+
+	funded := &splitTierBank{BankKeeperI: env.bankk, denom: "atom", amount: 150}
+	res := DeductFees(funded, ctx, acc, collector, fees)
+	require.False(t, res.IsErr(), "a fee covered by a split-tier balance must be accepted: %s", res.Log)
+	require.Equal(t, fees, funded.sent)
+
+	// One short, so this cannot pass against a DeductFees that checks nothing.
+	short := &splitTierBank{BankKeeperI: env.bankk, denom: "atom", amount: 149}
+	res = DeductFees(short, ctx, acc, collector, fees)
+	require.True(t, res.IsErr())
+	require.Contains(t, res.Log, "insufficient funds to pay for fees; 149atom < 150atom")
+	require.Empty(t, short.sent, "a refused fee must not be sent")
+}
+
+// Simulate normally skips signature verification so gas can be estimated
+// without a key. RequireSigForSimulate opts a message type out of that, for
+// messages whose authorization is derived from the signer: `.app/simulate` is
+// a public query that executes the messages, so the skip would otherwise let
+// an unauthenticated caller name somebody else's address.
+func TestAnteHandlerRequireSigForSimulate(t *testing.T) {
+	t.Parallel()
+
+	// A tx signed over the wrong account number: the signature is present and
+	// correctly counted (tx.ValidateBasic passes) but does not verify.
+	badlySignedTx := func(ctx sdk.Context, priv crypto.PrivKey, addr crypto.Address) std.Tx {
+		return tu.NewTestTx(t, ctx.ChainID(), []std.Msg{tu.NewTestMsg(addr)},
+			[]crypto.PrivKey{priv}, []uint64{1}, []uint64{0}, tu.NewTestFee())
+	}
+
+	tests := []struct {
+		name     string
+		requires func(std.Tx) bool
+		wantPass bool
+	}{
+		{"nil predicate keeps the skip", nil, true},
+		{"predicate declines: skip retained", func(std.Tx) bool { return false }, true},
+		{"predicate selects: verification enforced", func(std.Tx) bool { return true }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			env := setupTestEnv()
+			opts := defaultAnteOptions()
+			opts.RequireSigForSimulate = tt.requires
+			anteHandler := NewAnteHandler(env.acck, env.bankk,
+				DefaultSigVerificationGasConsumer, opts)
+			ctx := env.ctx
+
+			priv, _, addr := tu.KeyTestPubAddr()
+			acc := env.acck.NewAccountWithAddress(ctx, addr)
+			acc.SetCoins(tu.NewTestCoins())
+			require.NoError(t, acc.SetAccountNumber(0))
+			env.acck.SetAccount(ctx, acc)
+
+			tx := badlySignedTx(ctx, priv, addr)
+			if tt.wantPass {
+				checkValidTx(t, anteHandler, ctx, tx, true)
+			} else {
+				checkInvalidTx(t, anteHandler, ctx, tx, true, std.UnauthorizedError{})
+			}
+		})
+	}
+}
+
+// A correctly signed tx must still simulate cleanly when the predicate selects
+// it -- the point is to verify the signature, not to refuse simulation.
+func TestAnteHandlerRequireSigForSimulateAcceptsValidSig(t *testing.T) {
+	t.Parallel()
+
+	env := setupTestEnv()
+	opts := defaultAnteOptions()
+	opts.RequireSigForSimulate = func(std.Tx) bool { return true }
+	anteHandler := NewAnteHandler(env.acck, env.bankk,
+		DefaultSigVerificationGasConsumer, opts)
+	ctx := env.ctx
+
+	priv, _, addr := tu.KeyTestPubAddr()
+	acc := env.acck.NewAccountWithAddress(ctx, addr)
+	acc.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc.SetAccountNumber(0))
+	env.acck.SetAccount(ctx, acc)
+
+	tx := tu.NewTestTx(t, ctx.ChainID(), []std.Msg{tu.NewTestMsg(addr)},
+		[]crypto.PrivKey{priv}, []uint64{0}, []uint64{0}, tu.NewTestFee())
+	checkValidTx(t, anteHandler, ctx, tx, true)
+}
+
+// The node's minimum and the block minimum are one rule, and both now go through
+// GasPrice.IsGTE. When this cross-multiplied inline it did not inherit IsGTE's
+// guards: a negative gas_wanted flips the sign of one side, so a fee of nothing
+// compared as sufficient and the transaction entered the mempool.
+//
+// Nothing was exploitable -- SetGasMeter runs two lines later and NewGasMeter
+// panics on a negative limit -- but the two implementations disagreed on the
+// same inputs, and only one of them had been fixed.
+func TestMempoolFeeRefusesNonPositiveGasWanted(t *testing.T) {
+	t.Parallel()
+
+	minGP, err := std.ParseGasPrice("1ugnot/1000gas")
+	require.NoError(t, err)
+	ctx := sdk.NewContext(sdk.RunTxModeCheck, nil, &bft.Header{ChainID: "test"}, nil).
+		WithMinGasPrices([]std.GasPrice{minGP}).
+		// No block gas price, so the node minimum is the only rule in play.
+		WithValue(GasPriceContextKey{}, std.GasPrice{})
+
+	feeOf := func(gasWanted, amount int64) std.Fee {
+		return std.Fee{GasWanted: gasWanted, GasFee: std.Coin{Denom: "ugnot", Amount: amount}}
+	}
+
+	// Controls: the rule still works for real gas, in both directions.
+	require.True(t, EnsureSufficientMempoolFees(ctx, feeOf(1000, 10)).IsOK(),
+		"paying above the minimum must be accepted")
+	require.False(t, EnsureSufficientMempoolFees(ctx, feeOf(1000, 0)).IsOK(),
+		"paying nothing for real gas must be refused")
+
+	// A fee of nothing must not become sufficient by negating the gas.
+	for _, gasWanted := range []int64{-1, -1000, math.MinInt64} {
+		require.False(t, EnsureSufficientMempoolFees(ctx, feeOf(gasWanted, 0)).IsOK(),
+			"gas_wanted %d must be refused", gasWanted)
+	}
+}
+
+// A TRANSACTION SIGNED BY AN OLDER CLIENT STILL ENTERS THE CHAIN. The fee moved
+// to the shape the Ledger Cosmos app will parse, and clients build the signature
+// payload themselves -- wallets, the genesis tooling, anything holding a key.
+// They cannot all ship on the day the node does, and signatures already written
+// into a genesis file cannot ship at all. So the handler verifies against the
+// current rendering and falls back to the previous one.
+//
+// See std.VerifySignaturePayload for why taking both is safe rather than merely
+// convenient: the two fee key sets are disjoint, so a signature still authorises
+// exactly one transaction.
+func TestAnteHandlerAcceptsLegacySignBytes(t *testing.T) {
+	t.Parallel()
+
+	e := newSingleSignerEnv(t)
+
+	// Signed over the gas_wanted/gas_fee rendering, which is what a client
+	// that builds the payload itself may still produce.
+	legacyBytes, err := std.GetSignaturePayloadLegacy(e.signDoc())
+	require.NoError(t, err)
+
+	// Guard the guard: if the two renderings ever coincide, this test would
+	// pass without exercising the fallback at all.
+	currentBytes, err := std.GetSignaturePayload(e.signDoc())
+	require.NoError(t, err)
+	require.NotEqual(t, currentBytes, legacyBytes,
+		"the two renderings are identical, so this test proves nothing")
+
+	tx := tu.NewTestTxWithSignBytes(e.msgs, []crypto.PrivKey{e.priv}, e.fee, legacyBytes, "")
+	checkValidTx(t, e.anteHandler, e.ctx, tx, false)
+}
+
+// AND THE FALLBACK IS NOT A BYPASS. Accepting a second rendering must not widen
+// what a signature authorises: bytes signed over one sign doc must still be
+// refused against a different one, and nonsense must still be refused outright.
+// A fallback that swallowed the failure would pass every test above and this is
+// the one that would catch it.
+func TestAnteHandlerStillRejectsBadSignatures(t *testing.T) {
+	t.Parallel()
+
+	t.Run("signed over a different chain id", func(t *testing.T) {
+		t.Parallel()
+
+		e := newSingleSignerEnv(t)
+		doc := e.signDoc()
+		doc.ChainID = "some-other-chain"
+		wrong, err := std.GetSignaturePayloadLegacy(doc)
+		require.NoError(t, err)
+		tx := tu.NewTestTxWithSignBytes(e.msgs, []crypto.PrivKey{e.priv}, e.fee, wrong, "")
+		checkInvalidTx(t, e.anteHandler, e.ctx, tx, false, std.UnauthorizedError{})
+	})
+
+	t.Run("signed over a different sequence", func(t *testing.T) {
+		t.Parallel()
+
+		e := newSingleSignerEnv(t)
+		doc := e.signDoc()
+		doc.Sequence = 99
+		wrong, err := std.GetSignaturePayloadLegacy(doc)
+		require.NoError(t, err)
+		tx := tu.NewTestTxWithSignBytes(e.msgs, []crypto.PrivKey{e.priv}, e.fee, wrong, "")
+		checkInvalidTx(t, e.anteHandler, e.ctx, tx, false, std.UnauthorizedError{})
+	})
+
+	t.Run("not a signature at all", func(t *testing.T) {
+		t.Parallel()
+
+		e := newSingleSignerEnv(t)
+		tx := std.NewTx(e.msgs, e.fee, []std.Signature{{
+			PubKey: e.priv.PubKey(), Signature: []byte("nope"),
+		}}, "")
+		checkInvalidTx(t, e.anteHandler, e.ctx, tx, false, std.UnauthorizedError{})
+	})
+}
+
+// singleSignerEnv is a funded account with number 0 and sequence 0, the handler
+// that judges its transactions, and a message and fee for it to sign. Every test
+// builds its own: the ante handler writes to the store before it reaches
+// signature verification, and the store is not safe for concurrent use.
+type singleSignerEnv struct {
+	anteHandler sdk.AnteHandler
+	ctx         sdk.Context
+	priv        crypto.PrivKey
+	msgs        []std.Msg
+	fee         std.Fee
+}
+
+func newSingleSignerEnv(t *testing.T) singleSignerEnv {
+	t.Helper()
+
+	env := setupTestEnv()
+	anteHandler := NewAnteHandler(env.acck, env.bankk,
+		DefaultSigVerificationGasConsumer, defaultAnteOptions())
+	ctx := env.ctx
+
+	priv, _, addr := tu.KeyTestPubAddr()
+	acc := env.acck.NewAccountWithAddress(ctx, addr)
+	acc.SetCoins(tu.NewTestCoins())
+	require.NoError(t, acc.SetAccountNumber(0))
+	env.acck.SetAccount(ctx, acc)
+
+	return singleSignerEnv{
+		anteHandler: anteHandler,
+		ctx:         ctx,
+		priv:        priv,
+		msgs:        []std.Msg{tu.NewTestMsg(addr)},
+		fee:         tu.NewTestFee(),
+	}
+}
+
+// signDoc is the document the account's next transaction is signed over.
+func (e singleSignerEnv) signDoc() std.SignDoc {
+	return std.SignDoc{
+		ChainID:       e.ctx.ChainID(),
+		AccountNumber: 0,
+		Sequence:      0,
+		Fee:           e.fee,
+		Msgs:          e.msgs,
+	}
+}

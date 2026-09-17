@@ -1,0 +1,171 @@
+# aaa namespace
+loadpkg gno.land/r/aaa/bbb/ccc $WORK/ccc
+loadpkg gno.land/r/aaa/ccc/ddd $WORK/ddd
+loadpkg gno.land/r/aaa $WORK/aaa
+
+# bbb namespace
+loadpkg gno.land/r/bbb/ccc $WORK/ccc
+loadpkg gno.land/p/bbb/ccc/ppp $WORK/ppp
+loadpkg gno.land/r/bbb/aaa $WORK/aaa
+loadpkg gno.land/r/bbb0 $WORK/bbb0
+
+# foo-bar namespace (hyphenated; hyphens are allowed in intermediate path
+# elements, only the last element must match the package name)
+loadpkg gno.land/r/foo-bar/baz $WORK/baz
+loadpkg gno.land/p/foo-bar/pkg $WORK/pkg
+
+gnoland start
+
+# query path for prefix
+gnokey query vm/qpaths --data "gno.land/r/aaa"
+cmp stdout aaa-qpaths.stdout.golden
+cmp stderr empty_file
+
+gnokey query vm/qpaths --data "gno.land/r/bbb"
+cmp stdout bbb-qpaths.stdout.golden
+cmp stderr empty_file
+
+gnokey query vm/qpaths --data "gno.land/r/bbb/"
+cmp stdout bbb-slash-qpaths.stdout.golden
+cmp stderr empty_file
+
+# query path for namespace
+gnokey query vm/qpaths --data "@bbb"
+cmp stdout bbb-name-qpaths.stdout.golden
+cmp stderr empty_file
+
+# query path for namespace
+gnokey query vm/qpaths --data "@bbb/ccc"
+cmp stdout bbb-name-subpath-qpaths.stdout.golden
+cmp stderr empty_file
+
+! gnokey query vm/qpaths --data "@invalid\\name"
+cmp stdout invalid-name-qpaths.stdout.golden
+cmp stderr invalid-name-qpaths.stderr.golden
+
+gnokey query vm/qpaths --data "gno.land/r/ccc"
+cmp stdout ccc-qpaths.stdout.golden
+cmp stderr empty_file
+
+gnokey query vm/qpaths?limit=5 --data "_"
+cmp stdout stdlibs-qpaths.stdout.golden
+cmp stderr empty_file
+
+
+gnokey query vm/qpaths --data "_/encoding"
+cmp stdout stdlibs-encoding-qpaths.stdout.golden
+cmp stderr empty_file
+
+
+gnokey query vm/qpaths?limit=5 --data ""
+cmp stdout empty-qpaths.stdout.golden
+cmp stderr empty_file
+
+# query path for namespace with hyphen
+gnokey query vm/qpaths --data "@foo-bar"
+cmp stdout foo-bar-name-qpaths.stdout.golden
+cmp stderr empty_file
+
+gnokey query vm/qpaths --data "@foo-bar/baz"
+cmp stdout foo-bar-name-subpath-qpaths.stdout.golden
+cmp stderr empty_file
+
+-- aaa/aaa.gno --
+package aaa
+
+func Hello() { println("AAA") }
+
+-- ccc/ccc.gno --
+package ccc
+
+func Hello() { println("CCC") }
+
+-- ddd/ddd.gno --
+package ddd
+
+func Hello() { println("DDD") }
+
+-- ppp/ppp.gno --
+package ppp
+
+func Hello() { println("PPP") }
+
+-- bbb0/bbb0.gno --
+package bbb0
+
+func Hello() { println("BBB0") }
+
+-- baz/baz.gno --
+package baz
+
+func Hello() { println("BAZ") }
+
+-- pkg/pkg.gno --
+package pkg
+
+func Hello() { println("PKG") }
+
+-- aaa-qpaths.stdout.golden --
+height: 0
+data: gno.land/r/aaa
+gno.land/r/aaa/bbb/ccc
+gno.land/r/aaa/ccc/ddd
+-- bbb-qpaths.stdout.golden --
+height: 0
+data: gno.land/r/bbb/aaa
+gno.land/r/bbb/ccc
+gno.land/r/bbb0
+-- bbb-slash-qpaths.stdout.golden --
+height: 0
+data: gno.land/r/bbb/aaa
+gno.land/r/bbb/ccc
+-- bbb-name-qpaths.stdout.golden --
+height: 0
+data: gno.land/p/bbb/ccc/ppp
+gno.land/r/bbb/aaa
+gno.land/r/bbb/ccc
+-- bbb-name-subpath-qpaths.stdout.golden --
+height: 0
+data: gno.land/p/bbb/ccc/ppp
+gno.land/r/bbb/ccc
+-- invalid-name-qpaths.stdout.golden --
+Log: --= Error =--
+Data: errors.FmtError{format:"invalid username format", args:[]interface {}(nil)}
+Msg Traces:
+--= /Error =--
+
+-- invalid-name-qpaths.stderr.golden --
+"gnokey" error: invalid username format
+-- foo-bar-name-qpaths.stdout.golden --
+height: 0
+data: gno.land/p/foo-bar/pkg
+gno.land/r/foo-bar/baz
+-- foo-bar-name-subpath-qpaths.stdout.golden --
+height: 0
+data: gno.land/r/foo-bar/baz
+-- ccc-qpaths.stdout.golden --
+height: 0
+data: 
+-- empty-qpaths.stdout.golden --
+height: 0
+data: bufio
+bytes
+chain
+chain/banker
+chain/markdown
+-- stdlibs-qpaths.stdout.golden --
+height: 0
+data: bufio
+bytes
+chain
+chain/banker
+chain/markdown
+-- stdlibs-encoding-qpaths.stdout.golden --
+height: 0
+data: encoding
+encoding/base32
+encoding/base64
+encoding/binary
+encoding/csv
+encoding/hex
+-- empty_file --

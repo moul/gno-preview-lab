@@ -1,0 +1,437 @@
+// Package transpiler implements a source-to-source compiler for translating Gno
+// code into Go code.
+package transpiler
+
+import (
+	"bytes"
+	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	goscanner "go/scanner"
+	"go/token"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/gnolang/gno/gnovm/pkg/gnoenv"
+	gno "github.com/gnolang/gno/gnovm/pkg/gnolang"
+	"github.com/gnolang/gno/gnovm/stdlibs"
+	"golang.org/x/tools/go/ast/astutil"
+)
+
+// ImportPrefix is the import path to the root of the gno repository, which should
+// be used to create go import paths.
+const ImportPrefix = "github.com/gnolang/gno"
+
+// TranspileImportPath takes an import path s, and converts it into the full
+// import path relative to the Gno repository.
+func TranspileImportPath(s string) string {
+	return ImportPrefix + "/" + PackageDirLocation(s)
+}
+
+// PackageDirLocation provides the supposed directory of the package, relative to the root dir.
+//
+// TODO(morgan): move out, this should go in a "resolver" package.
+func PackageDirLocation(s string) string {
+	switch {
+	case !gno.IsStdlib(s):
+		return "examples/" + s
+	default:
+		return "gnovm/stdlibs/" + s
+	}
+}
+
+// ImportResolver maps a Gno import path to its location relative to the
+// gno repo root. ok=false means the import is unresolvable.
+type ImportResolver func(importPath string) (relPath string, ok bool)
+
+// DefaultResolver returns "examples/<path>" for non-stdlibs and
+// "gnovm/stdlibs/<path>" for stdlibs. When rootDir is non-empty it also
+// checks the resolved path exists on disk.
+func DefaultResolver(rootDir string) ImportResolver {
+	return func(importPath string) (string, bool) {
+		rel := PackageDirLocation(importPath)
+		if rootDir == "" {
+			return rel, true
+		}
+		if _, err := os.Stat(filepath.Join(rootDir, rel)); err != nil {
+			return "", false
+		}
+		return rel, true
+	}
+}
+
+// Result is returned by Transpile, returning the file's imports and output
+// out the transpilation.
+type Result struct {
+	Imports    []*ast.ImportSpec
+	Translated string
+	File       *ast.File
+}
+
+// TODO: func TranspileFile: supports caching.
+// TODO: func TranspilePkg: supports directories.
+
+// TranspiledFilenameAndTags returns the filename and tags for transpiled files.
+func TranspiledFilenameAndTags(gnoFilePath string) (targetFilename, tags string) {
+	nameNoExtension := strings.TrimSuffix(filepath.Base(gnoFilePath), ".gno")
+	switch {
+	case strings.HasSuffix(gnoFilePath, "_filetest.gno"):
+		tags = "gno && filetest"
+		targetFilename = "." + nameNoExtension + ".gno.gen.go"
+	case strings.HasSuffix(gnoFilePath, "_test.gno"):
+		tags = "gno && test"
+		targetFilename = "." + nameNoExtension + ".gno.gen_test.go"
+	default:
+		tags = "gno"
+		targetFilename = nameNoExtension + ".gno.gen.go"
+	}
+	return
+}
+
+// Transpile performs transpilation on the given source code. tags can be
+// used to specify build tags; filename helps generate useful error messages
+// and discriminate between test and normal source files. Equivalent to
+// [TranspileWithResolver] with a nil resolver.
+func Transpile(source, tags, filename string) (*Result, error) {
+	return TranspileWithResolver(source, tags, filename, nil)
+}
+
+// TranspileWithResolver is like [Transpile] but uses the supplied resolver
+// for import lookups. A nil resolver falls back to [DefaultResolver].
+func TranspileWithResolver(source, tags, filename string, resolver ImportResolver) (*Result, error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, source,
+		// SkipObjectResolution -- unused here.
+		// ParseComments -- so that they show up when re-building the AST.
+		parser.SkipObjectResolution|parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+
+	isTestFile := strings.HasSuffix(filename, "_test.gno") || strings.HasSuffix(filename, "_filetest.gno")
+	rootDir := gnoenv.RootDir()
+	ctx := &transpileCtx{
+		rootDir: rootDir,
+	}
+	stdlibPrefix := filepath.Join(ctx.rootDir, "gnovm", "stdlibs")
+	if isTestFile {
+		// XXX(morgan): this disables checking that a package exists (in examples or stdlibs)
+		// when transpiling a test file. After all Gno functions, including those in
+		// tests/imports.go are converted to native bindings, support should
+		// be added for transpiling stdlibs only available in tests/stdlibs, and
+		// enable as such "package checking" also on test files.
+		ctx.rootDir = ""
+	}
+	if resolver == nil {
+		resolver = DefaultResolver(ctx.rootDir)
+	}
+	ctx.importResolver = resolver
+	absFilename, err := filepath.Abs(filename)
+	if err != nil {
+		return nil, fmt.Errorf("cannot get absolute path of filename: %w", err)
+	}
+	if after, ok := strings.CutPrefix(absFilename, stdlibPrefix); ok {
+		// this is a standard library. Mark it in the options so the native
+		// bindings resolve correctly.
+		path := after
+		path = filepath.ToSlash(filepath.Dir(path))
+		path = strings.TrimLeft(path, "/")
+
+		ctx.stdlibPath = path
+	}
+
+	transformed, err := ctx.transformFile(fset, f)
+	if err != nil {
+		return nil, fmt.Errorf("transpileAST: %w", err)
+	}
+
+	var out bytes.Buffer
+	// Write file header
+	out.WriteString("// Code generated by github.com/gnolang/gno. DO NOT EDIT.\n\n")
+	if tags != "" {
+		fmt.Fprintf(&out, "//go:build %s\n\n", tags)
+	}
+	// Add a //line directive so the go compiler outputs the original gno
+	// filename and the file's position that corresponds to it.
+	// See https://pkg.go.dev/cmd/compile#hdr-Compiler_Directives
+	fmt.Fprintf(&out, "//line %s:1:1\n", filepath.Base(filename))
+
+	// Write file content and format it.
+	err = format.Node(&out, fset, transformed)
+	if err != nil {
+		return nil, fmt.Errorf("format.Node: %w", err)
+	}
+
+	res := &Result{
+		Imports:    f.Imports,
+		Translated: out.String(),
+		File:       transformed,
+	}
+	return res, nil
+}
+
+type transpileCtx struct {
+	rootDir        string
+	importResolver ImportResolver
+	// This should be set if we're working with a file from a standard library.
+	// This allows us to easily check if a function has a native binding, and as
+	// such modify its call expressions appropriately.
+	stdlibPath string
+
+	stdlibImports map[string]string // symbol -> import path
+}
+
+func (ctx *transpileCtx) transformFile(fset *token.FileSet, f *ast.File) (*ast.File, error) {
+	var errs goscanner.ErrorList
+
+	imports := astutil.Imports(fset, f)
+	ctx.stdlibImports = make(map[string]string)
+
+	// rewrite imports to point to stdlibs/ or examples/
+	for _, paragraph := range imports {
+		for _, importSpec := range paragraph {
+			importPath, err := strconv.Unquote(importSpec.Path.Value)
+			if err != nil {
+				errs.Add(fset.Position(importSpec.Pos()), fmt.Sprintf("can't unquote import path %s: %v", importSpec.Path.Value, err))
+				continue
+			}
+
+			rel, ok := ctx.importResolver(importPath)
+			if !ok {
+				errs.Add(fset.Position(importSpec.Pos()), fmt.Sprintf("import %q does not exist", importPath))
+				continue
+			}
+
+			// Create mapping
+			if gno.IsStdlib(importPath) {
+				if importSpec.Name != nil {
+					ctx.stdlibImports[importSpec.Name.Name] = importPath
+				} else {
+					// XXX: imperfect, see comment on transformCallExpr
+					ctx.stdlibImports[gno.LastPathElement(importPath)] = importPath
+				}
+			}
+
+			importSpec.Path.Value = strconv.Quote(ImportPrefix + "/" + rel)
+		}
+	}
+
+	// custom handler
+	node := astutil.Apply(f,
+		// pre
+		func(c *astutil.Cursor) bool {
+			switch node := c.Node().(type) {
+			case *ast.FuncDecl:
+				// is function declaration without body?
+				// -> delete (native binding)
+				if node.Body == nil {
+					c.Delete()
+					return false // don't attempt to traverse children
+				}
+				if node.Recv == nil && node.Name.Name == "init" && node.Type.Params.NumFields() == 1 {
+					p0 := node.Type.Params.List[0]
+					if id, ok := p0.Type.(*ast.Ident); ok && id.Name == "realm" {
+						node.Type.Params = nil
+						node.Body.List = slices.Insert(node.Body.List, 0, ast.Stmt(&ast.AssignStmt{
+							Lhs: []ast.Expr{p0.Names[0]},
+							Tok: token.DEFINE,
+							Rhs: []ast.Expr{&ast.CallExpr{
+								// converted later
+								Fun:  &ast.Ident{Name: "realm"},
+								Args: []ast.Expr{&ast.Ident{Name: "nil"}},
+							}},
+						}))
+					}
+				}
+			case *ast.CallExpr:
+				// is function call to a native function?
+				// -> rename if unexported, apply `nil,` for the first arg if necessary
+				return ctx.transformCallExpr(c, node)
+			}
+
+			return true
+		},
+
+		// post
+		func(c *astutil.Cursor) bool {
+			switch node := c.Node().(type) {
+			case *ast.Field:
+				if ct := convertBuiltinType(node.Type, fset, f); ct != nil {
+					// convert type in struct field or param in general.
+					node.Type = ct
+				}
+			case *ast.TypeSpec:
+				if ct := convertBuiltinType(node.Type, fset, f); ct != nil {
+					node.Type = ct
+				}
+			case *ast.StarExpr:
+				if ct := convertBuiltinType(node.X, fset, f); ct != nil {
+					node.X = ct
+				}
+			case *ast.ArrayType:
+				if ct := convertBuiltinType(node.Elt, fset, f); ct != nil {
+					node.Elt = ct
+				}
+			case *ast.Ellipsis:
+				if ct := convertBuiltinType(node.Elt, fset, f); ct != nil {
+					node.Elt = ct
+				}
+			case *ast.MapType:
+				if ct := convertBuiltinType(node.Key, fset, f); ct != nil {
+					node.Key = ct
+				}
+				if ct := convertBuiltinType(node.Value, fset, f); ct != nil {
+					node.Value = ct
+				}
+			case *ast.TypeAssertExpr:
+				if ct := convertBuiltinType(node.Type, fset, f); ct != nil {
+					node.Type = ct
+				}
+			case *ast.TypeSwitchStmt:
+				for _, node := range node.Body.List {
+					if cc, isCaseClause := node.(*ast.CaseClause); isCaseClause {
+						for idx, t := range cc.List {
+							if ct := convertBuiltinType(t, fset, f); ct != nil {
+								cc.List[idx] = ct
+							}
+						}
+					}
+				}
+			case *ast.ValueSpec:
+				if ct := convertBuiltinType(node.Type, fset, f); ct != nil {
+					node.Type = ct
+				}
+			case *ast.CallExpr:
+				id, ok := node.Fun.(*ast.Ident)
+				if !ok {
+					break
+				}
+				if ct := convertBuiltinType(id, fset, f); ct != nil {
+					node.Fun = ct
+					break
+				}
+				// perform in post as the first arg in these functions may be a closure or
+				// other type which needs earlier processing.
+				switch id.Name {
+				case "istypednil":
+					if len(node.Args) != 1 {
+						panic(fmt.Sprintf("invalid istypednil() call with %d args", len(node.Args)))
+					}
+					c.Replace(&ast.BinaryExpr{
+						X:  node.Args[0],
+						Op: token.NEQ,
+						Y:  ast.NewIdent("nil"),
+						// It's not exactly this, but it's close enough
+						// and it might be better prefer if we removed the global anyway: https://github.com/gnolang/gno/pull/4259
+					})
+				case "revive":
+					if len(node.Args) != 1 {
+						panic(fmt.Sprintf("invalid istypednil() call with %d args", len(node.Args)))
+					}
+
+					// Writing this with AST types is much more complex; parse
+					// the resulting expression and replace `X` with the
+					// argument of revive().
+					x, err := parser.ParseExpr(`
+func() (__revive_recover any) {
+	defer func() { __revive_recover = recover() }()
+	X()
+	return
+}()`)
+					if err != nil {
+						panic(err)
+					}
+					es := x.(*ast.CallExpr).
+						Fun.(*ast.FuncLit).
+						Body.List[1].(*ast.ExprStmt).
+						X.(*ast.CallExpr)
+					es.Fun = node.Args[0]
+					c.Replace(x)
+				}
+			}
+
+			return true
+		},
+	)
+	return node.(*ast.File), errs.Err()
+}
+
+func convertBuiltinType(ide ast.Expr, fset *token.FileSet, f *ast.File) ast.Expr {
+	id, ok := ide.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	switch id.Name {
+	case "realm",
+		"address",
+		"gnocoin",
+		"gnocoins":
+		astutil.AddNamedImport(fset, f, "__transpile_builtin", TranspileImportPath("builtin"))
+		return &ast.SelectorExpr{
+			X: &ast.Ident{
+				Name: "__transpile_builtin",
+			},
+			Sel: &ast.Ident{
+				Name: string(id.Name[0]-('a'-'A')) + id.Name[1:],
+			},
+		}
+	}
+	return nil
+}
+
+func (ctx *transpileCtx) transformCallExpr(c *astutil.Cursor, ce *ast.CallExpr) bool {
+	switch fe := ce.Fun.(type) {
+	case *ast.SelectorExpr:
+		// XXX: This is not correct in 100% of cases. If I shadow the `std` symbol, and
+		// its replacement is a type with the method AssertOriginCall, this system
+		// will incorrectly add a `nil` as the first argument.
+		// A full fix requires understanding scope; the Go standard library recommends
+		// using go/types, which for proper functioning requires an importer
+		// which can work with Gno. This is deferred for a future PR.
+		id, ok := fe.X.(*ast.Ident)
+		if !ok {
+			break
+		}
+		ip, ok := ctx.stdlibImports[id.Name]
+		if !ok {
+			break
+		}
+		nat := stdlibs.FindNative(ip, gno.Name(fe.Sel.Name))
+		if nat != nil && nat.HasMachineParam() {
+			// Because it's an import, the symbol is always exported, so no need for the
+			// X_ prefix we add below.
+			ce.Args = append([]ast.Expr{ast.NewIdent("nil")}, ce.Args...)
+		}
+
+	case *ast.Ident:
+		// cross(rlm) is a gno-level sentinel for explicit cross-realm
+		// dispatch; the preprocessor handles its actual lowering. For
+		// the gno-to-go transpile build, treat it as a pass-through
+		// identity so the resulting Go code compiles.
+		if fe.Name == "cross" && len(ce.Args) == 1 {
+			c.Replace(ce.Args[0])
+			return true
+		}
+		// Is this a native binding?
+		// Note: this is only useful within packages like `std` and `math`.
+		// The logic here is not robust to be generic. It does not account for locally
+		// defined scope. However, because native bindings have a narrowly defined and
+		// controlled scope (standard libraries) this will work for our usecase.
+		nat := stdlibs.FindNative(ctx.stdlibPath, gno.Name(fe.Name))
+		if ctx.stdlibPath != "" && nat != nil {
+			if nat.HasMachineParam() {
+				ce.Args = append([]ast.Expr{ast.NewIdent("nil")}, ce.Args...)
+			}
+			if !fe.IsExported() {
+				// Prefix unexported names with X_, per native binding convention
+				// (to export the symbol within Go).
+				fe.Name = "X_" + fe.Name
+			}
+		}
+	}
+	return true
+}

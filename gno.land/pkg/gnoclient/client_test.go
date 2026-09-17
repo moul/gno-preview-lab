@@ -1,0 +1,1734 @@
+package gnoclient
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/gnolang/gno/tm2/pkg/amino"
+	abciErrors "github.com/gnolang/gno/tm2/pkg/bft/abci/example/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/gnolang/gno/gno.land/pkg/gnoland/ugnot"
+	"github.com/gnolang/gno/gno.land/pkg/keyscli"
+	"github.com/gnolang/gno/gno.land/pkg/sdk/vm"
+	"github.com/gnolang/gno/gnovm/stdlibs/chain"
+	abci "github.com/gnolang/gno/tm2/pkg/bft/abci/types"
+	ctypes "github.com/gnolang/gno/tm2/pkg/bft/rpc/core/types"
+	"github.com/gnolang/gno/tm2/pkg/bft/types"
+	"github.com/gnolang/gno/tm2/pkg/crypto"
+	"github.com/gnolang/gno/tm2/pkg/crypto/keys"
+	"github.com/gnolang/gno/tm2/pkg/sdk/bank"
+	"github.com/gnolang/gno/tm2/pkg/std"
+)
+
+var testGasFee = ugnot.ValueString(10000)
+
+func TestRender(t *testing.T) {
+	t.Parallel()
+	testRealmPath := "gno.land/r/tests/vm/deep/very/deep"
+	expectedRender := []byte("it works!")
+
+	client := Client{
+		Signer: &mockSigner{
+			sign: func(cfg SignCfg) (*std.Tx, error) {
+				return &std.Tx{}, nil
+			},
+			info: func() (keys.Info, error) {
+				return &mockKeysInfo{
+					getAddress: func() crypto.Address {
+						adr, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+						return adr
+					},
+				}, nil
+			},
+		},
+		RPCClient: &mockRPCClient{
+			abciQuery: func(ctx context.Context, path string, data []byte) (*ctypes.ResultABCIQuery, error) {
+				res := &ctypes.ResultABCIQuery{
+					Response: abci.ResponseQuery{
+						ResponseBase: abci.ResponseBase{
+							Data: expectedRender,
+						},
+					},
+				}
+				return res, nil
+			},
+		},
+	}
+
+	res, data, err := client.Render(testRealmPath, "")
+	assert.NoError(t, err)
+	assert.NotEmpty(t, data.Response.Data)
+	assert.NotEmpty(t, res)
+	assert.Equal(t, data.Response.Data, expectedRender)
+}
+
+// Call tests
+func TestCallSingle(t *testing.T) {
+	t.Parallel()
+
+	client := Client{
+		Signer: &mockSigner{
+			sign: func(cfg SignCfg) (*std.Tx, error) {
+				return &std.Tx{}, nil
+			},
+			info: func() (keys.Info, error) {
+				return &mockKeysInfo{
+					getAddress: func() crypto.Address {
+						adr, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+						return adr
+					},
+				}, nil
+			},
+		},
+		RPCClient: &mockRPCClient{
+			broadcastTxCommit: func(ctx context.Context, tx types.Tx) (*ctypes.ResultBroadcastTxCommit, error) {
+				res := &ctypes.ResultBroadcastTxCommit{
+					DeliverTx: abci.ResponseDeliverTx{
+						ResponseBase: abci.ResponseBase{
+							Data: []byte("it works!"),
+						},
+					},
+				}
+				return res, nil
+			},
+		},
+	}
+
+	cfg := BaseTxCfg{
+		GasWanted:      100000,
+		GasFee:         testGasFee,
+		AccountNumber:  1,
+		SequenceNumber: 1,
+		Memo:           "Test memo",
+	}
+
+	caller, err := client.Signer.Info()
+	require.NoError(t, err)
+
+	msg := []vm.MsgCall{
+		{
+			Caller:  caller.GetAddress(),
+			PkgPath: "gno.land/r/tests/vm/deep/very/deep",
+			Func:    "Render",
+			Args:    []string{""},
+			Send:    std.Coins{{Denom: ugnot.Denom, Amount: int64(100)}},
+		},
+	}
+
+	res, err := client.Call(cfg, msg...)
+	assert.NoError(t, err)
+	require.NotNil(t, res)
+	expected := "it works!"
+	assert.Equal(t, string(res.DeliverTx.Data), expected)
+
+	res, err = callSigningSeparately(t, client, cfg, msg...)
+	assert.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, string(res.DeliverTx.Data), expected)
+}
+
+func TestCallMultiple(t *testing.T) {
+	t.Parallel()
+
+	client := Client{
+		Signer: &mockSigner{
+			sign: func(cfg SignCfg) (*std.Tx, error) {
+				return &std.Tx{}, nil
+			},
+			info: func() (keys.Info, error) {
+				return &mockKeysInfo{
+					getAddress: func() crypto.Address {
+						adr, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+						return adr
+					},
+				}, nil
+			},
+		},
+		RPCClient: &mockRPCClient{
+			broadcastTxCommit: func(ctx context.Context, tx types.Tx) (*ctypes.ResultBroadcastTxCommit, error) {
+				res := &ctypes.ResultBroadcastTxCommit{
+					CheckTx: abci.ResponseCheckTx{
+						ResponseBase: abci.ResponseBase{
+							Error:  nil,
+							Data:   nil,
+							Events: nil,
+							Log:    "",
+							Info:   "",
+						},
+					},
+				}
+
+				return res, nil
+			},
+		},
+	}
+
+	cfg := BaseTxCfg{
+		GasWanted:      100000,
+		GasFee:         testGasFee,
+		AccountNumber:  1,
+		SequenceNumber: 1,
+		Memo:           "Test memo",
+	}
+
+	caller, err := client.Signer.Info()
+	require.NoError(t, err)
+
+	msg := []vm.MsgCall{
+		{
+			Caller:  caller.GetAddress(),
+			PkgPath: "gno.land/r/tests/vm/deep/very/deep",
+			Func:    "Render",
+			Args:    []string{""},
+			Send:    std.Coins{{Denom: ugnot.Denom, Amount: int64(100)}},
+		},
+		{
+			Caller:  caller.GetAddress(),
+			PkgPath: "gno.land/r/gnoland/wugnot",
+			Func:    "Deposit",
+			Args:    []string{""},
+			Send:    std.Coins{{Denom: ugnot.Denom, Amount: int64(1000)}},
+		},
+		{
+			Caller:  caller.GetAddress(),
+			PkgPath: "gno.land/r/demo/tamagotchi",
+			Func:    "Feed",
+			Args:    []string{""},
+			Send:    nil,
+		},
+	}
+
+	res, err := client.Call(cfg, msg...)
+	assert.NoError(t, err)
+	assert.NotNil(t, res)
+
+	res, err = callSigningSeparately(t, client, cfg, msg...)
+	assert.NoError(t, err)
+	assert.NotNil(t, res)
+}
+
+func TestCallErrors(t *testing.T) {
+	t.Parallel()
+
+	// These tests don't actually sign
+	mockAddress, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+
+	testCases := []struct {
+		name          string
+		client        Client
+		cfg           BaseTxCfg
+		msgs          []vm.MsgCall
+		expectedError string
+	}{
+		{
+			name: "Invalid Signer",
+			client: Client{
+				Signer:    nil,
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgCall{
+				{
+					Caller:  mockAddress,
+					PkgPath: "gno.land/r/random/path",
+					Func:    "RandomName",
+					Send:    nil,
+					Args:    []string{},
+				},
+			},
+			expectedError: ErrMissingSigner.Error(),
+		},
+		{
+			name: "Invalid RPCClient",
+			client: Client{
+				&mockSigner{},
+				nil,
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgCall{
+				{
+					Caller:  mockAddress,
+					PkgPath: "gno.land/r/random/path",
+					Func:    "RandomName",
+					Send:    nil,
+					Args:    []string{},
+				},
+			},
+			expectedError: ErrMissingRPCClient.Error(),
+		},
+		{
+			name: "Invalid Gas Fee",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         "",
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgCall{
+				{
+					Caller:  mockAddress,
+					PkgPath: "gno.land/r/random/path",
+					Func:    "RandomName",
+				},
+			},
+			expectedError: ErrInvalidGasFee.Error(),
+		},
+		{
+			name: "Negative Gas Wanted",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      -1,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgCall{
+				{
+					Caller:  mockAddress,
+					PkgPath: "gno.land/r/random/path",
+					Func:    "RandomName",
+					Send:    nil,
+					Args:    []string{},
+				},
+			},
+			expectedError: ErrInvalidGasWanted.Error(),
+		},
+		{
+			name: "0 Gas Wanted",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      0,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgCall{
+				{
+					Caller:  mockAddress,
+					PkgPath: "gno.land/r/random/path",
+					Func:    "RandomName",
+					Send:    nil,
+					Args:    []string{},
+				},
+			},
+			expectedError: ErrInvalidGasWanted.Error(),
+		},
+		{
+			name: "Invalid PkgPath",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgCall{
+				{
+					Caller:  mockAddress,
+					PkgPath: "",
+					Func:    "RandomName",
+					Send:    nil,
+					Args:    []string{},
+				},
+			},
+			expectedError: vm.InvalidPkgPathError{}.Error(),
+		},
+		{
+			name: "Invalid FuncName",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgCall{
+				{
+					Caller:  mockAddress,
+					PkgPath: "gno.land/r/random/path",
+					Func:    "",
+					Send:    nil,
+					Args:    []string{},
+				},
+			},
+			expectedError: vm.InvalidExprError{}.Error(),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := tc.client.Call(tc.cfg, tc.msgs...)
+			assert.Nil(t, res)
+			assert.ErrorContains(t, err, tc.expectedError)
+		})
+	}
+}
+
+func TestClient_Send_Errors(t *testing.T) {
+	t.Parallel()
+
+	// These tests don't actually sign
+	mockAddress, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+
+	toAddress, _ := crypto.AddressFromBech32("g14a0y9a64dugh3l7hneshdxr4w0rfkkww9ls35p")
+	testCases := []struct {
+		name          string
+		client        Client
+		cfg           BaseTxCfg
+		msgs          []bank.MsgSend
+		expectedError string
+	}{
+		{
+			name: "Invalid Signer",
+			client: Client{
+				Signer:    nil,
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []bank.MsgSend{
+				{
+					FromAddress: mockAddress,
+					ToAddress:   toAddress,
+					Amount:      std.Coins{{Denom: ugnot.Denom, Amount: int64(1)}},
+				},
+			},
+			expectedError: ErrMissingSigner.Error(),
+		},
+		{
+			name: "Invalid RPCClient",
+			client: Client{
+				&mockSigner{},
+				nil,
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []bank.MsgSend{
+				{
+					FromAddress: mockAddress,
+					ToAddress:   toAddress,
+					Amount:      std.Coins{{Denom: ugnot.Denom, Amount: int64(1)}},
+				},
+			},
+			expectedError: ErrMissingRPCClient.Error(),
+		},
+		{
+			name: "Invalid Gas Fee",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         "",
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []bank.MsgSend{
+				{
+					FromAddress: mockAddress,
+					ToAddress:   toAddress,
+					Amount:      std.Coins{{Denom: ugnot.Denom, Amount: int64(1)}},
+				},
+			},
+			expectedError: ErrInvalidGasFee.Error(),
+		},
+		{
+			name: "Negative Gas Wanted",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      -1,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []bank.MsgSend{
+				{
+					FromAddress: mockAddress,
+					ToAddress:   toAddress,
+					Amount:      std.Coins{{Denom: ugnot.Denom, Amount: int64(1)}},
+				},
+			},
+			expectedError: ErrInvalidGasWanted.Error(),
+		},
+		{
+			name: "0 Gas Wanted",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      0,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []bank.MsgSend{
+				{
+					FromAddress: mockAddress,
+					ToAddress:   toAddress,
+					Amount:      std.Coins{{Denom: ugnot.Denom, Amount: int64(1)}},
+				},
+			},
+			expectedError: ErrInvalidGasWanted.Error(),
+		},
+		{
+			name: "Invalid To Address",
+			client: Client{
+				Signer: &mockSigner{
+					info: func() (keys.Info, error) {
+						return &mockKeysInfo{
+							getAddress: func() crypto.Address {
+								adr, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+								return adr
+							},
+						}, nil
+					},
+				},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []bank.MsgSend{
+				{
+					FromAddress: mockAddress,
+					ToAddress:   crypto.Address{},
+					Amount:      std.Coins{{Denom: ugnot.Denom, Amount: int64(1)}},
+				},
+			},
+			expectedError: std.InvalidAddressError{}.Error(),
+		},
+		{
+			name: "Invalid Send Coins",
+			client: Client{
+				Signer: &mockSigner{
+					info: func() (keys.Info, error) {
+						return &mockKeysInfo{
+							getAddress: func() crypto.Address {
+								adr, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+								return adr
+							},
+						}, nil
+					},
+				},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []bank.MsgSend{
+				{
+					FromAddress: mockAddress,
+					ToAddress:   toAddress,
+					Amount:      std.Coins{{Denom: ugnot.Denom, Amount: int64(-1)}},
+				},
+			},
+			expectedError: std.InvalidCoinsError{}.Error(),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := tc.client.Send(tc.cfg, tc.msgs...)
+			assert.Nil(t, res)
+			assert.ErrorContains(t, err, tc.expectedError)
+		})
+	}
+}
+
+// Run tests
+func TestRunSingle(t *testing.T) {
+	t.Parallel()
+
+	client := Client{
+		Signer: &mockSigner{
+			sign: func(cfg SignCfg) (*std.Tx, error) {
+				return &std.Tx{}, nil
+			},
+			info: func() (keys.Info, error) {
+				return &mockKeysInfo{
+					getAddress: func() crypto.Address {
+						adr, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+						return adr
+					},
+				}, nil
+			},
+		},
+		RPCClient: &mockRPCClient{
+			broadcastTxCommit: func(ctx context.Context, tx types.Tx) (*ctypes.ResultBroadcastTxCommit, error) {
+				res := &ctypes.ResultBroadcastTxCommit{
+					DeliverTx: abci.ResponseDeliverTx{
+						ResponseBase: abci.ResponseBase{
+							Data: []byte("hi gnoclient!\n"),
+						},
+					},
+				}
+				return res, nil
+			},
+		},
+	}
+
+	cfg := BaseTxCfg{
+		GasWanted:      100000,
+		GasFee:         testGasFee,
+		AccountNumber:  1,
+		SequenceNumber: 1,
+		Memo:           "Test memo",
+	}
+
+	fileBody := `package main
+import (
+	"std"
+	"gno.land/p/nt/ufmt/v0"
+	"gno.land/r/tests/vm/deep/very/deep"
+)
+func main() {
+	println(ufmt.Sprintf("%s", deep.Render("gnoclient!")))
+}`
+
+	caller, err := client.Signer.Info()
+	require.NoError(t, err)
+
+	msg := vm.MsgRun{
+		Caller: caller.GetAddress(),
+		Package: &std.MemPackage{
+			Files: []*std.MemFile{
+				{
+					Name: "main.gno",
+					Body: fileBody,
+				},
+			},
+		},
+		Send: nil,
+	}
+
+	res, err := client.Run(cfg, msg)
+	assert.NoError(t, err)
+	require.NotNil(t, res)
+	expected := "hi gnoclient!\n"
+	assert.Equal(t, expected, string(res.DeliverTx.Data))
+
+	res, err = runSigningSeparately(t, client, cfg, msg)
+	assert.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, expected, string(res.DeliverTx.Data))
+}
+
+func TestRunMultiple(t *testing.T) {
+	t.Parallel()
+
+	client := Client{
+		Signer: &mockSigner{
+			sign: func(cfg SignCfg) (*std.Tx, error) {
+				return &std.Tx{}, nil
+			},
+			info: func() (keys.Info, error) {
+				return &mockKeysInfo{
+					getAddress: func() crypto.Address {
+						adr, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+						return adr
+					},
+				}, nil
+			},
+		},
+		RPCClient: &mockRPCClient{
+			broadcastTxCommit: func(ctx context.Context, tx types.Tx) (*ctypes.ResultBroadcastTxCommit, error) {
+				res := &ctypes.ResultBroadcastTxCommit{
+					DeliverTx: abci.ResponseDeliverTx{
+						ResponseBase: abci.ResponseBase{
+							Data: []byte("hi gnoclient!\nhi gnoclient!\n"),
+						},
+					},
+				}
+				return res, nil
+			},
+		},
+	}
+
+	cfg := BaseTxCfg{
+		GasWanted:      100000,
+		GasFee:         testGasFee,
+		AccountNumber:  1,
+		SequenceNumber: 1,
+		Memo:           "Test memo",
+	}
+
+	fileBody := `package main
+import (
+	"std"
+	"gno.land/p/nt/ufmt/v0"
+	"gno.land/r/tests/vm/deep/very/deep"
+)
+func main() {
+	println(ufmt.Sprintf("%s", deep.Render("gnoclient!")))
+}`
+
+	caller, err := client.Signer.Info()
+	require.NoError(t, err)
+
+	msg1 := vm.MsgRun{
+		Caller: caller.GetAddress(),
+		Package: &std.MemPackage{
+			Files: []*std.MemFile{
+				{
+					Name: "main1.gno",
+					Body: fileBody,
+				},
+			},
+		},
+		Send: nil,
+	}
+
+	msg2 := vm.MsgRun{
+		Caller: caller.GetAddress(),
+		Package: &std.MemPackage{
+			Files: []*std.MemFile{
+				{
+					Name: "main2.gno",
+					Body: fileBody,
+				},
+			},
+		},
+		Send: nil,
+	}
+
+	res, err := client.Run(cfg, msg1, msg2)
+	assert.NoError(t, err)
+	require.NotNil(t, res)
+	expected := "hi gnoclient!\nhi gnoclient!\n"
+	assert.Equal(t, expected, string(res.DeliverTx.Data))
+
+	res, err = runSigningSeparately(t, client, cfg, msg1, msg2)
+	assert.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, expected, string(res.DeliverTx.Data))
+}
+
+func TestRunErrors(t *testing.T) {
+	t.Parallel()
+
+	// These tests don't actually sign
+	mockAddress, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+
+	testCases := []struct {
+		name          string
+		client        Client
+		cfg           BaseTxCfg
+		msgs          []vm.MsgRun
+		expectedError string
+	}{
+		{
+			name: "Invalid Signer",
+			client: Client{
+				Signer:    nil,
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgRun{
+				{
+					Caller: mockAddress,
+					Package: &std.MemPackage{
+						Name: "",
+						Path: "",
+						Files: []*std.MemFile{
+							{
+								Name: "file1.gno",
+								Body: "",
+							},
+						},
+					},
+					Send: nil,
+				},
+			},
+			expectedError: ErrMissingSigner.Error(),
+		},
+		{
+			name: "Invalid RPCClient",
+			client: Client{
+				&mockSigner{},
+				nil,
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs:          []vm.MsgRun{},
+			expectedError: ErrMissingRPCClient.Error(),
+		},
+		{
+			name: "Invalid Gas Fee",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         "",
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgRun{
+				{
+					Caller: mockAddress,
+					Package: &std.MemPackage{
+						Name: "",
+						Path: "",
+						Files: []*std.MemFile{
+							{
+								Name: "file1.gno",
+								Body: "",
+							},
+						},
+					},
+					Send: nil,
+				},
+			},
+			expectedError: ErrInvalidGasFee.Error(),
+		},
+		{
+			name: "Negative Gas Wanted",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      -1,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgRun{
+				{
+					Caller: mockAddress,
+					Package: &std.MemPackage{
+						Name: "",
+						Path: "",
+						Files: []*std.MemFile{
+							{
+								Name: "file1.gno",
+								Body: "",
+							},
+						},
+					},
+					Send: nil,
+				},
+			},
+			expectedError: ErrInvalidGasWanted.Error(),
+		},
+		{
+			name: "0 Gas Wanted",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      0,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgRun{
+				{
+					Caller: mockAddress,
+					Package: &std.MemPackage{
+						Name: "",
+						Path: "",
+						Files: []*std.MemFile{
+							{
+								Name: "file1.gno",
+								Body: "",
+							},
+						},
+					},
+					Send: nil,
+				},
+			},
+			expectedError: ErrInvalidGasWanted.Error(),
+		},
+		{
+			name: "Invalid Empty Package",
+			client: Client{
+				Signer: &mockSigner{
+					info: func() (keys.Info, error) {
+						return &mockKeysInfo{
+							getAddress: func() crypto.Address {
+								adr, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+								return adr
+							},
+						}, nil
+					},
+				},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgRun{
+				{
+					Caller:  mockAddress,
+					Package: &std.MemPackage{Name: "", Path: " "},
+					Send:    nil,
+				},
+			},
+			expectedError: vm.InvalidPkgPathError{}.Error(),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := tc.client.Run(tc.cfg, tc.msgs...)
+			assert.Nil(t, res)
+			assert.ErrorContains(t, err, tc.expectedError)
+		})
+	}
+}
+
+// AddPackage tests
+func TestAddPackageErrors(t *testing.T) {
+	t.Parallel()
+
+	// These tests don't actually sign
+	mockAddress, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+
+	testCases := []struct {
+		name          string
+		client        Client
+		cfg           BaseTxCfg
+		msgs          []vm.MsgAddPackage
+		expectedError string
+	}{
+		{
+			name: "Invalid Signer",
+			client: Client{
+				Signer:    nil,
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgAddPackage{
+				{
+					Creator: mockAddress,
+					Package: &std.MemPackage{
+						Name: "",
+						Path: "",
+						Files: []*std.MemFile{
+							{
+								Name: "file1.gno",
+								Body: "",
+							},
+						},
+					},
+					MaxDeposit: nil,
+				},
+			},
+			expectedError: ErrMissingSigner.Error(),
+		},
+		{
+			name: "Invalid RPCClient",
+			client: Client{
+				&mockSigner{},
+				nil,
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs:          []vm.MsgAddPackage{},
+			expectedError: ErrMissingRPCClient.Error(),
+		},
+		{
+			name: "Invalid Gas Fee",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         "",
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgAddPackage{
+				{
+					Creator: mockAddress,
+					Package: &std.MemPackage{
+						Name: "",
+						Path: "",
+						Files: []*std.MemFile{
+							{
+								Name: "file1.gno",
+								Body: "",
+							},
+						},
+					},
+					MaxDeposit: nil,
+				},
+			},
+			expectedError: ErrInvalidGasFee.Error(),
+		},
+		{
+			name: "Negative Gas Wanted",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      -1,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgAddPackage{
+				{
+					Creator: mockAddress,
+					Package: &std.MemPackage{
+						Name: "",
+						Path: "",
+						Files: []*std.MemFile{
+							{
+								Name: "file1.gno",
+								Body: "",
+							},
+						},
+					},
+					MaxDeposit: nil,
+				},
+			},
+			expectedError: ErrInvalidGasWanted.Error(),
+		},
+		{
+			name: "0 Gas Wanted",
+			client: Client{
+				Signer:    &mockSigner{},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      0,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgAddPackage{
+				{
+					Creator: mockAddress,
+					Package: &std.MemPackage{
+						Name: "",
+						Path: "",
+						Files: []*std.MemFile{
+							{
+								Name: "file1.gno",
+								Body: "",
+							},
+						},
+					},
+					MaxDeposit: nil,
+				},
+			},
+			expectedError: ErrInvalidGasWanted.Error(),
+		},
+		{
+			name: "Invalid Empty Package",
+			client: Client{
+				Signer: &mockSigner{
+					info: func() (keys.Info, error) {
+						return &mockKeysInfo{
+							getAddress: func() crypto.Address {
+								adr, _ := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+								return adr
+							},
+						}, nil
+					},
+				},
+				RPCClient: &mockRPCClient{},
+			},
+			cfg: BaseTxCfg{
+				GasWanted:      100000,
+				GasFee:         testGasFee,
+				AccountNumber:  1,
+				SequenceNumber: 1,
+				Memo:           "Test memo",
+			},
+			msgs: []vm.MsgAddPackage{
+				{
+					Creator:    mockAddress,
+					Package:    &std.MemPackage{Name: "", Path: ""},
+					MaxDeposit: nil,
+				},
+			},
+			expectedError: vm.InvalidPkgPathError{}.Error(),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := tc.client.AddPackage(tc.cfg, tc.msgs...)
+			assert.Nil(t, res)
+			assert.ErrorContains(t, err, tc.expectedError)
+		})
+	}
+}
+
+// Block tests
+func TestBlock(t *testing.T) {
+	t.Parallel()
+
+	height := int64(5)
+	client := &Client{
+		Signer: &mockSigner{},
+		RPCClient: &mockRPCClient{
+			block: func(ctx context.Context, height *int64) (*ctypes.ResultBlock, error) {
+				return &ctypes.ResultBlock{
+					BlockMeta: &types.BlockMeta{
+						BlockID: types.BlockID{},
+						Header:  types.Header{},
+					},
+					Block: &types.Block{
+						Header: types.Header{
+							Height: *height,
+						},
+						Data:       types.Data{},
+						LastCommit: nil,
+					},
+				}, nil
+			},
+		},
+	}
+
+	block, err := client.Block(height)
+	require.NoError(t, err)
+	assert.Equal(t, height, block.Block.GetHeight())
+}
+
+func TestBlockResults(t *testing.T) {
+	t.Parallel()
+
+	height := int64(5)
+	client := &Client{
+		Signer: &mockSigner{},
+		RPCClient: &mockRPCClient{
+			blockResults: func(ctx context.Context, height *int64) (*ctypes.ResultBlockResults, error) {
+				return &ctypes.ResultBlockResults{
+					Height:  *height,
+					Results: nil,
+				}, nil
+			},
+		},
+	}
+
+	blockResult, err := client.BlockResult(height)
+	require.NoError(t, err)
+	assert.Equal(t, height, blockResult.Height)
+}
+
+func TestLatestBlockHeight(t *testing.T) {
+	t.Parallel()
+
+	latestHeight := int64(5)
+
+	client := &Client{
+		Signer: &mockSigner{},
+		RPCClient: &mockRPCClient{
+			status: func(ctx context.Context, heightGte *int64) (*ctypes.ResultStatus, error) {
+				return &ctypes.ResultStatus{
+					SyncInfo: ctypes.SyncInfo{
+						LatestBlockHeight: latestHeight,
+					},
+				}, nil
+			},
+		},
+	}
+
+	head, err := client.LatestBlockHeight()
+	require.NoError(t, err)
+	assert.Equal(t, latestHeight, head)
+}
+
+func TestBlockErrors(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		client        Client
+		height        int64
+		expectedError error
+	}{
+		{
+			name: "Invalid RPCClient",
+			client: Client{
+				&mockSigner{},
+				nil,
+			},
+			height:        1,
+			expectedError: ErrMissingRPCClient,
+		},
+		{
+			name: "Invalid height",
+			client: Client{
+				&mockSigner{},
+				&mockRPCClient{},
+			},
+			height:        0,
+			expectedError: ErrInvalidBlockHeight,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := tc.client.Block(tc.height)
+			assert.Nil(t, res)
+			assert.ErrorIs(t, err, tc.expectedError)
+		})
+	}
+}
+
+func TestBlockResultErrors(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		client        Client
+		height        int64
+		expectedError error
+	}{
+		{
+			name: "Invalid RPCClient",
+			client: Client{
+				&mockSigner{},
+				nil,
+			},
+			height:        1,
+			expectedError: ErrMissingRPCClient,
+		},
+		{
+			name: "Invalid height",
+			client: Client{
+				&mockSigner{},
+				&mockRPCClient{},
+			},
+			height:        0,
+			expectedError: ErrInvalidBlockHeight,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := tc.client.BlockResult(tc.height)
+			assert.Nil(t, res)
+			assert.ErrorIs(t, err, tc.expectedError)
+		})
+	}
+}
+
+func TestLatestBlockHeightErrors(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		client        Client
+		expectedError error
+	}{
+		{
+			name: "Invalid RPCClient",
+			client: Client{
+				&mockSigner{},
+				nil,
+			},
+			expectedError: ErrMissingRPCClient,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := tc.client.LatestBlockHeight()
+			assert.Equal(t, int64(0), res)
+			assert.ErrorIs(t, err, tc.expectedError)
+		})
+	}
+}
+
+// The same as client.Call, but test signing separately
+func callSigningSeparately(t *testing.T, client Client, cfg BaseTxCfg, msgs ...vm.MsgCall) (*ctypes.ResultBroadcastTxCommit, error) {
+	t.Helper()
+	tx, err := NewCallTx(cfg, msgs...)
+	assert.NoError(t, err)
+	require.NotNil(t, tx)
+	signedTx, err := client.SignTx(*tx, cfg.AccountNumber, cfg.SequenceNumber)
+	assert.NoError(t, err)
+	require.NotNil(t, signedTx)
+	res, err := client.BroadcastTxCommit(signedTx)
+	assert.NoError(t, err)
+	require.NotNil(t, res)
+	return res, nil
+}
+
+// The same as client.Run, but test signing separately
+func runSigningSeparately(t *testing.T, client Client, cfg BaseTxCfg, msgs ...vm.MsgRun) (*ctypes.ResultBroadcastTxCommit, error) {
+	t.Helper()
+	tx, err := NewRunTx(cfg, msgs...)
+	assert.NoError(t, err)
+	require.NotNil(t, tx)
+	signedTx, err := client.SignTx(*tx, cfg.AccountNumber, cfg.SequenceNumber)
+	assert.NoError(t, err)
+	require.NotNil(t, signedTx)
+	res, err := client.BroadcastTxCommit(signedTx)
+	assert.NoError(t, err)
+	require.NotNil(t, res)
+	return res, nil
+}
+
+// The same as client.Send, but test signing separately
+func sendSigningSeparately(t *testing.T, client Client, cfg BaseTxCfg, msgs ...bank.MsgSend) (*ctypes.ResultBroadcastTxCommit, error) {
+	t.Helper()
+	tx, err := NewSendTx(cfg, msgs...)
+	assert.NoError(t, err)
+	require.NotNil(t, tx)
+	signedTx, err := client.SignTx(*tx, cfg.AccountNumber, cfg.SequenceNumber)
+	assert.NoError(t, err)
+	require.NotNil(t, signedTx)
+	res, err := client.BroadcastTxCommit(signedTx)
+	assert.NoError(t, err)
+	require.NotNil(t, res)
+	return res, nil
+}
+
+// The same as client.AddPackage, but test signing separately
+func addPackageSigningSeparately(t *testing.T, client Client, cfg BaseTxCfg, msgs ...vm.MsgAddPackage) (*ctypes.ResultBroadcastTxCommit, error) {
+	t.Helper()
+	tx, err := NewAddPackageTx(cfg, msgs...)
+	assert.NoError(t, err)
+	require.NotNil(t, tx)
+	signedTx, err := client.SignTx(*tx, cfg.AccountNumber, cfg.SequenceNumber)
+	assert.NoError(t, err)
+	require.NotNil(t, signedTx)
+	res, err := client.BroadcastTxCommit(signedTx)
+	assert.NoError(t, err)
+	require.NotNil(t, res)
+	return res, nil
+}
+
+func TestClient_EstimateGas(t *testing.T) {
+	t.Parallel()
+
+	t.Run("RPC client not set", func(t *testing.T) {
+		t.Parallel()
+
+		c := &Client{
+			RPCClient: nil, // not set
+		}
+
+		estimate, err := c.EstimateGas(&std.Tx{})
+
+		assert.Zero(t, estimate)
+		assert.ErrorIs(t, err, ErrMissingRPCClient)
+	})
+
+	t.Run("unsuccessful query, rpc error", func(t *testing.T) {
+		t.Parallel()
+
+		var (
+			rpcErr        = errors.New("rpc error")
+			mockRPCClient = &mockRPCClient{
+				abciQuery: func(ctx context.Context, path string, data []byte) (*ctypes.ResultABCIQuery, error) {
+					require.Equal(t, simulatePath, path)
+
+					var tx std.Tx
+
+					require.NoError(t, amino.Unmarshal(data, &tx))
+
+					return nil, rpcErr
+				},
+			}
+		)
+
+		c := &Client{
+			RPCClient: mockRPCClient,
+		}
+
+		estimate, err := c.EstimateGas(&std.Tx{})
+
+		assert.Zero(t, estimate)
+		assert.ErrorIs(t, err, rpcErr)
+	})
+
+	t.Run("unsuccessful query, process error", func(t *testing.T) {
+		t.Parallel()
+
+		var (
+			response = &ctypes.ResultABCIQuery{
+				Response: abci.ResponseQuery{
+					ResponseBase: abci.ResponseBase{
+						Error: abciErrors.UnknownError{},
+					},
+				},
+			}
+			mockRPCClient = &mockRPCClient{
+				abciQuery: func(ctx context.Context, path string, data []byte) (*ctypes.ResultABCIQuery, error) {
+					require.Equal(t, simulatePath, path)
+
+					var tx std.Tx
+
+					require.NoError(t, amino.Unmarshal(data, &tx))
+
+					return response, nil
+				},
+			}
+		)
+
+		c := &Client{
+			RPCClient: mockRPCClient,
+		}
+
+		estimate, err := c.EstimateGas(&std.Tx{})
+
+		assert.Zero(t, estimate)
+		assert.ErrorIs(t, err, abciErrors.UnknownError{})
+	})
+
+	t.Run("invalid response format", func(t *testing.T) {
+		t.Parallel()
+
+		var (
+			response = &ctypes.ResultABCIQuery{
+				Response: abci.ResponseQuery{
+					Value: []byte("totally valid amino"),
+				},
+			}
+			mockRPCClient = &mockRPCClient{
+				abciQuery: func(ctx context.Context, path string, data []byte) (*ctypes.ResultABCIQuery, error) {
+					require.Equal(t, simulatePath, path)
+
+					var tx std.Tx
+
+					require.NoError(t, amino.Unmarshal(data, &tx))
+
+					return response, nil
+				},
+			}
+		)
+
+		c := &Client{
+			RPCClient: mockRPCClient,
+		}
+
+		estimate, err := c.EstimateGas(&std.Tx{})
+
+		assert.Zero(t, estimate)
+		assert.ErrorContains(t, err, "unable to unmarshal simulation response")
+	})
+
+	t.Run("valid gas estimation", func(t *testing.T) {
+		t.Parallel()
+
+		var (
+			gasUsed     = int64(100000)
+			deliverResp = &abci.ResponseDeliverTx{
+				GasUsed: gasUsed,
+			}
+		)
+
+		// Encode the response
+		encodedResp, err := amino.Marshal(deliverResp)
+		require.NoError(t, err)
+
+		var (
+			response = &ctypes.ResultABCIQuery{
+				Response: abci.ResponseQuery{
+					Value: encodedResp, // valid amino binary
+				},
+			}
+			mockRPCClient = &mockRPCClient{
+				abciQuery: func(ctx context.Context, path string, data []byte) (*ctypes.ResultABCIQuery, error) {
+					require.Equal(t, simulatePath, path)
+
+					var tx std.Tx
+
+					require.NoError(t, amino.Unmarshal(data, &tx))
+
+					return response, nil
+				},
+			}
+		)
+
+		c := &Client{
+			RPCClient: mockRPCClient,
+		}
+
+		estimate, err := c.EstimateGas(&std.Tx{})
+
+		require.NoError(t, err)
+		assert.Equal(t, gasUsed, estimate)
+	})
+
+	t.Run("valid simulate", func(t *testing.T) {
+		t.Parallel()
+
+		var (
+			gasUsed     = int64(100000)
+			deliverResp = &abci.ResponseDeliverTx{
+				GasUsed: gasUsed,
+				ResponseBase: abci.ResponseBase{
+					Events: []abci.Event{
+						&chain.StorageDepositEvent{
+							BytesDelta: 10,
+							FeeDelta:   std.Coin{Denom: ugnot.Denom, Amount: 1000},
+						},
+					},
+				},
+			}
+		)
+
+		// Encode the response
+		encodedResp, err := amino.Marshal(deliverResp)
+		require.NoError(t, err)
+
+		var (
+			response = &ctypes.ResultABCIQuery{
+				Response: abci.ResponseQuery{
+					Value: encodedResp, // valid amino binary
+				},
+			}
+			mockRPCClient = &mockRPCClient{
+				abciQuery: func(ctx context.Context, path string, data []byte) (*ctypes.ResultABCIQuery, error) {
+					require.Equal(t, simulatePath, path)
+
+					var tx std.Tx
+
+					require.NoError(t, amino.Unmarshal(data, &tx))
+
+					return response, nil
+				},
+			}
+		)
+
+		c := &Client{
+			RPCClient: mockRPCClient,
+		}
+
+		deliverTx, err := c.Simulate(&std.Tx{})
+
+		require.NoError(t, err)
+		assert.Equal(t, gasUsed, deliverTx.GasUsed)
+
+		bytesDelta, coinsDelta, hasStorageEvents := keyscli.GetStorageInfo(deliverTx.Events)
+		assert.Equal(t, true, hasStorageEvents)
+		assert.Equal(t, int64(10), bytesDelta)
+		assert.Equal(t, "1000ugnot", coinsDelta.String())
+	})
+}
+
+func TestQueryBalanceAndSupply(t *testing.T) {
+	t.Parallel()
+
+	addr, err := crypto.AddressFromBech32("g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5")
+	require.NoError(t, err)
+	const realmDenom = "/gno.land/r/demo/foo:gold"
+
+	// Records the path so the realm denom's slashes can be checked to survive.
+	newClient := func(data string, gotPath *string) *Client {
+		return &Client{
+			RPCClient: &mockRPCClient{
+				abciQuery: func(_ context.Context, path string, _ []byte) (*ctypes.ResultABCIQuery, error) {
+					*gotPath = path
+					return &ctypes.ResultABCIQuery{Response: abci.ResponseQuery{
+						ResponseBase: abci.ResponseBase{Data: []byte(data)},
+					}}, nil
+				},
+			},
+		}
+	}
+
+	// Every other Client method has a nil-RPCClient case (TestBlockErrors,
+	// TestLatestBlockHeightErrors, TestEstimateGas, ...); these two are new, so
+	// they need one too, or nothing checks that they validate before dereferencing.
+	t.Run("no RPC client", func(t *testing.T) {
+		t.Parallel()
+		c := &Client{RPCClient: nil}
+
+		coins, _, err := c.QueryBalance(addr)
+		assert.ErrorIs(t, err, ErrMissingRPCClient)
+		assert.Nil(t, coins)
+
+		supply, _, err := c.QuerySupply("ugnot")
+		assert.ErrorIs(t, err, ErrMissingRPCClient)
+		assert.Zero(t, supply)
+	})
+
+	// A response that does not decode must not read as an empty answer. This is the
+	// same defect as the node-error case below, one layer down: swallowing the
+	// decode error returns a zero balance or a zero supply with err == nil.
+	t.Run("an undecodable response is not an empty answer", func(t *testing.T) {
+		t.Parallel()
+		var path string
+
+		coins, _, err := newClient(`{`, &path).QueryBalance(addr)
+		require.Error(t, err, "an undecodable response must not be read as a balance")
+		require.Nil(t, coins)
+
+		supply, _, err := newClient(`{`, &path).QuerySupply("ugnot")
+		require.Error(t, err, "an undecodable response must not be read as a supply")
+		require.Zero(t, supply)
+	})
+
+	t.Run("balance across both tiers", func(t *testing.T) {
+		t.Parallel()
+		var path string
+		coins, _, err := newClient(`"7`+realmDenom+`,100ugnot"`, &path).QueryBalance(addr)
+		require.NoError(t, err)
+		require.Equal(t, "bank/balances/"+crypto.AddressToBech32(addr), path)
+		require.Equal(t, int64(100), coins.AmountOf("ugnot"))
+		require.Equal(t, int64(7), coins.AmountOf(realmDenom))
+	})
+
+	t.Run("supply of a realm denom keeps its slashes", func(t *testing.T) {
+		t.Parallel()
+		var path string
+		supply, _, err := newClient(`"42"`, &path).QuerySupply(realmDenom)
+		require.NoError(t, err)
+		require.Equal(t, "bank/supply/"+realmDenom, path,
+			"the denom must reach the route whole, not split")
+		require.Equal(t, int64(42), supply)
+	})
+
+	// A node error response must not be read as data. The same defect was fixed on
+	// the handler side in this change — queryBalance was missing a return, so an
+	// error response also carried a balance — and QuerySupply is the worse case
+	// here: swallowing the error means returning 0, which a caller reads as
+	// "this denom has no supply".
+	t.Run("a node error is not mistaken for an answer", func(t *testing.T) {
+		t.Parallel()
+		// Data is deliberately well-formed as well. With an empty body, skipping the
+		// error check still fails on the amino decode, so the assertion would hold
+		// either way; a decodable body is what makes this discriminating.
+		errClient := func(data string) *Client {
+			return &Client{RPCClient: &mockRPCClient{
+				abciQuery: func(_ context.Context, _ string, _ []byte) (*ctypes.ResultABCIQuery, error) {
+					return &ctypes.ResultABCIQuery{Response: abci.ResponseQuery{
+						ResponseBase: abci.ResponseBase{
+							Error: abci.StringError("boom"),
+							Data:  []byte(data),
+						},
+					}}, nil
+				},
+			}}
+		}
+
+		_, _, err := errClient(`"100ugnot"`).QueryBalance(addr)
+		require.Error(t, err, "an error response must not be read as a balance")
+		require.ErrorContains(t, err, "boom", "the node's error must be the one returned")
+
+		supply, _, err := errClient(`"42"`).QuerySupply(realmDenom)
+		require.Error(t, err, "an error response must not be read as a supply")
+		require.ErrorContains(t, err, "boom", "the node's error must be the one returned")
+		require.Zero(t, supply, "and no plausible-looking number alongside it")
+	})
+
+	t.Run("a malformed denom is rejected before the round trip", func(t *testing.T) {
+		t.Parallel()
+		var path string
+		_, _, err := newClient(`"0"`, &path).QuerySupply("UPPER")
+		require.Error(t, err)
+		require.Empty(t, path, "an invalid denom must not reach the node")
+	})
+}

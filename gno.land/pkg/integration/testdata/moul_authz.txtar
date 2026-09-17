@@ -1,0 +1,93 @@
+loadpkg gno.land/p/moul/authz/v0
+loadpkg gno.land/r/testing/admin $WORK/admin
+loadpkg gno.land/r/testing/resource $WORK/resource
+
+adduserfrom alice 'smooth crawl poverty trumpet glare useful curtain annual pluck lunar example merge ready forum better verb rescue rule mechanic dynamic drift bench release weekend'
+stdout 'g1rfznvu6qfa0sc76cplk5wpqexvefqccjunady0'
+
+gnoland start
+
+gnokey maketx call -pkgpath gno.land/r/testing/resource -func Edit -args edited -gas-fee 740001ugnot -gas-wanted 7_600_000 -chainid tendermint_test alice
+
+gnokey maketx call -pkgpath gno.land/r/testing/admin -func ExecuteAction -args 0 -gas-fee 760001ugnot -gas-wanted 7_600_000 -chainid tendermint_test alice
+
+gnokey maketx call -pkgpath gno.land/r/testing/resource -func Value -gas-fee 190001ugnot -gas-wanted 1_900_000 -chainid tendermint_test alice
+stdout 'edited'
+
+
+-- admin/gnomod.toml --
+module = "gno.land/r/demo/admin"
+
+gno "0.9"
+-- admin/admin.gno --
+package admin
+
+import (
+	"chain/runtime/unsafe"
+	"errors"
+
+	"gno.land/p/moul/authz/v0"
+)
+
+type prop struct {
+	title  string
+	action authz.PrivilegedAction
+}
+
+var props []*prop
+
+func HandlePrivilegedAction(title string, action authz.PrivilegedAction) error {
+	if unsafe.CurrentRealm().PkgPath() != "gno.land/r/testing/resource" {
+		return errors.New("unauthorized proposer")
+	}
+	props = append(props, &prop{title: title, action: action})
+	return nil
+}
+
+func ExecuteAction(cur realm, index int) {
+	if unsafe.PreviousRealm().Address() != "g1rfznvu6qfa0sc76cplk5wpqexvefqccjunady0" {
+		panic(errors.New("not alice"))
+	}
+	if err := props[index].action(); err != nil {
+		panic(err)
+	}
+}
+-- resource/gnomod.toml --
+module = "gno.land/r/demo/resource"
+
+gno "0.9"
+-- resource/resource.gno --
+package resource
+
+import (
+	"gno.land/p/moul/authz/v0"
+	"gno.land/r/testing/admin"
+)
+
+// This is the async DAO-style flow: an arbitrary user proposes, the admin
+// realm queues the proposal, and ExecuteAction runs it later. A plain
+// NewContractAuthority would reject the user at the proposer (its default
+// proposer is the admin contract itself), so widen the proposer explicitly.
+// admin.HandlePrivilegedAction remains the trust boundary: it only accepts
+// proposals routed through this realm.
+var a *authz.Authorizer = authz.NewWithAuthority(authz.NewRestrictedContractAuthority(
+	"gno.land/r/testing/admin",
+	admin.HandlePrivilegedAction,
+	authz.NewAutoAcceptAuthority(),
+))
+
+var value = "init"
+
+func Value(cur realm) string {
+	return value
+}
+
+func Edit(cur realm, newValue string) {
+	doEdit := func() error {
+		value = newValue
+		return nil
+	}
+	if err := a.DoByPrevious(0, cur, "Edit", doEdit); err != nil {
+		panic(err)
+	}
+}

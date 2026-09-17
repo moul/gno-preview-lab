@@ -1,0 +1,546 @@
+package amino
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"reflect"
+	"strings"
+
+	"github.com/gnolang/gno/tm2/pkg/errors"
+)
+
+// ----------------------------------------
+// cdc.decodeReflectJSON
+
+// CONTRACT: rv.CanAddr() is true.
+func (cdc *Codec) decodeReflectJSON(bz []byte, info *TypeInfo, rv reflect.Value, fopts FieldOptions, anyDepth int) (err error) {
+	if !rv.CanAddr() {
+		panic("rv not addressable")
+	}
+	if info.Type.Kind() == reflect.Interface && rv.Kind() == reflect.Pointer {
+		panic("should not happen")
+	}
+	if printLog {
+		fmt.Printf("(D) decodeReflectJSON(bz: %s, info: %v, rv: %#v (%v), fopts: %v)\n",
+			bz, info, rv.Interface(), rv.Type(), fopts)
+		defer func() {
+			fmt.Printf("(D) -> err: %v\n", err)
+		}()
+	}
+
+	// JSON null means "use default value" for all types (proto3 JSON spec).
+	// For nullable types (pointer, slice, map, interface), default is nil/zero.
+	// For scalar types (string, int, bool), default is the zero value.
+	if nullBytes(bz) {
+		rv.Set(defaultValue(rv.Type()))
+		return
+	}
+
+	// Dereference-and-construct if pointer.
+	rv = maybeDerefAndConstruct(rv)
+
+	// Handle the most special case, "well known".
+	if info.ConcreteInfo.IsJSONWellKnownType {
+		var ok bool
+		ok, err = decodeReflectJSONWellKnown(bz, info, rv, fopts)
+		if ok || err != nil {
+			return
+		}
+	}
+
+	// Handle override if a pointer to rv implements UnmarshalAmino.
+	if info.IsAminoMarshaler {
+		// First, decode repr instance from bytes.
+		rrv := reflect.New(info.ReprType.Type).Elem()
+		rinfo := info.ReprType
+		err = cdc.decodeReflectJSON(bz, rinfo, rrv, fopts, anyDepth)
+		if err != nil {
+			return
+		}
+		// Then, decode from repr instance.
+		uwrm := rv.Addr().MethodByName("UnmarshalAmino")
+		uwouts := uwrm.Call([]reflect.Value{rrv})
+		erri := uwouts[0].Interface()
+		if erri != nil {
+			err = erri.(error)
+		}
+		return
+	}
+
+	switch ikind := info.Type.Kind(); ikind {
+	// ----------------------------------------
+	// Complex
+
+	case reflect.Interface:
+		err = cdc.decodeReflectJSONInterface(bz, info, rv, fopts, anyDepth+1)
+
+	case reflect.Array:
+		err = cdc.decodeReflectJSONArray(bz, info, rv, fopts, anyDepth)
+
+	case reflect.Slice:
+		err = cdc.decodeReflectJSONSlice(bz, info, rv, fopts, anyDepth)
+
+	case reflect.Struct:
+		err = cdc.decodeReflectJSONStruct(bz, info, rv, fopts, anyDepth)
+
+	// ----------------------------------------
+	// Signed, Unsigned
+
+	case reflect.Int64, reflect.Int:
+		fallthrough
+	case reflect.Uint64, reflect.Uint:
+		if bz[0] != '"' || bz[len(bz)-1] != '"' {
+			err = errors.New(
+				"invalid character -- Amino:JSON int/int64/uint/uint64 expects quoted values for javascript numeric support, got: %v", //nolint: lll
+				string(bz),
+			)
+			if err != nil {
+				return
+			}
+		}
+		bz = bz[1 : len(bz)-1]
+		fallthrough
+	case reflect.Int32, reflect.Int16, reflect.Int8,
+		reflect.Uint32, reflect.Uint16, reflect.Uint8:
+		err = invokeStdlibJSONUnmarshal(bz, rv, fopts)
+
+	// ----------------------------------------
+	// Misc
+
+	case reflect.Float32, reflect.Float64:
+		if !fopts.Unsafe {
+			return errors.New("amino:JSON float* support requires `amino:\"unsafe\"`")
+		}
+		fallthrough
+	case reflect.Bool, reflect.String:
+		err = invokeStdlibJSONUnmarshal(bz, rv, fopts)
+
+	// ----------------------------------------
+	// Default
+
+	default:
+		panic(fmt.Sprintf("unsupported type %v", info.Type.Kind()))
+	}
+
+	return err
+}
+
+func invokeStdlibJSONUnmarshal(bz []byte, rv reflect.Value, fopts FieldOptions) error {
+	if !rv.CanAddr() && rv.Kind() != reflect.Pointer {
+		panic("rv not addressable nor pointer")
+	}
+
+	rrv := rv
+	if rv.Kind() != reflect.Pointer {
+		rrv = reflect.New(rv.Type())
+	}
+
+	if err := json.Unmarshal(bz, rrv.Interface()); err != nil {
+		return err
+	}
+	rv.Set(rrv.Elem())
+	return nil
+}
+
+// CONTRACT: rv.CanAddr() is true.
+func (cdc *Codec) decodeReflectJSONInterface(bz []byte, iinfo *TypeInfo, rv reflect.Value,
+	fopts FieldOptions, anyDepth int,
+) (err error) {
+	if anyDepth > maxAnyDepth {
+		return fmt.Errorf("exceeded max Any nesting depth %d", maxAnyDepth)
+	}
+	if !rv.CanAddr() {
+		panic("rv not addressable")
+	}
+	if printLog {
+		fmt.Println("(d) decodeReflectJSONInterface")
+		defer func() {
+			fmt.Printf("(d) -> err: %v\n", err)
+		}()
+	}
+
+	/*
+		We don't make use of user-provided interface values because there are a
+		lot of edge cases.
+
+		* What if the type is mismatched?
+		* What if the JSON field entry is missing?
+		* Circular references?
+	*/
+	if !rv.IsNil() {
+		// We don't strictly need to set it nil, but lets keep it here for a
+		// while in case we forget, for defensive purposes.
+		rv.Set(iinfo.ZeroValue)
+	}
+
+	// Extract type_url.
+	typeURL, value, err := extractJSONTypeURL(bz)
+	if err != nil {
+		return
+	}
+
+	// NOTE: Unlike decodeReflectBinaryInterface, we already dealt with nil in decodeReflectJSON.
+
+	// Get concrete type info.
+	// NOTE: Unlike decodeReflectBinaryInterface, uses the full type_url string,
+	// which if generated by Amino, is the name preceded by a single slash.
+	var cinfo *TypeInfo
+	cinfo, err = cdc.getTypeInfoFromTypeURLRLock(typeURL, fopts)
+	if err != nil {
+		return
+	}
+
+	// Extract the value bytes.
+	if cinfo.IsJSONAnyValueType || (cinfo.IsAminoMarshaler && cinfo.ReprType.IsJSONAnyValueType) {
+		bz = value
+	} else {
+		bz, err = deriveJSONObject(bz, typeURL)
+		if err != nil {
+			return
+		}
+	}
+
+	// Construct the concrete type.
+	crv, irvSet := constructConcreteType(cinfo)
+
+	// Decode into the concrete type.
+	err = cdc.decodeReflectJSON(bz, cinfo, crv, fopts, anyDepth)
+	if err != nil {
+		// Verify that the decoded concrete type is assignable to the target interface.
+		// This prevents panics when a registered type doesn't implement the target interface.
+		if !irvSet.Type().AssignableTo(rv.Type()) {
+			err = fmt.Errorf("decoded type %v is not assignable to interface %v", irvSet.Type(), rv.Type())
+			return
+		}
+		rv.Set(irvSet) // Helps with debugging
+		return
+	}
+
+	// We need to set here, for when !PointerPreferred and the type
+	// is say, an array of bytes (e.g. [32]byte), then we must call
+	// rv.Set() *after* the value was acquired.
+	// Verify that the decoded concrete type is assignable to the target interface.
+	// This prevents panics when a registered type doesn't implement the target interface.
+	if !irvSet.Type().AssignableTo(rv.Type()) {
+		err = fmt.Errorf("decoded type %v is not assignable to interface %v", irvSet.Type(), rv.Type())
+		return
+	}
+	rv.Set(irvSet)
+	return err
+}
+
+// CONTRACT: rv.CanAddr() is true.
+func (cdc *Codec) decodeReflectJSONArray(bz []byte, info *TypeInfo, rv reflect.Value, fopts FieldOptions, anyDepth int) (err error) {
+	if !rv.CanAddr() {
+		panic("rv not addressable")
+	}
+	if printLog {
+		fmt.Println("(d) decodeReflectJSONArray")
+		defer func() {
+			fmt.Printf("(d) -> err: %v\n", err)
+		}()
+	}
+	ert := info.Type.Elem()
+	length := info.Type.Len()
+
+	switch ert.Kind() {
+	case reflect.Uint8: // Special case: byte array
+		var buf []byte
+		err = json.Unmarshal(bz, &buf)
+		if err != nil {
+			return
+		}
+		if len(buf) != length {
+			err = fmt.Errorf("decodeReflectJSONArray: byte-length mismatch, got %v want %v",
+				len(buf), length)
+		}
+		reflect.Copy(rv, reflect.ValueOf(buf))
+		return
+
+	default: // General case.
+		var einfo *TypeInfo
+		einfo, err = cdc.getTypeInfoWLock(ert)
+		if err != nil {
+			return
+		}
+
+		// Read into rawSlice.
+		var rawSlice []json.RawMessage
+		if err = json.Unmarshal(bz, &rawSlice); err != nil {
+			return
+		}
+		if len(rawSlice) != length {
+			err = fmt.Errorf("decodeReflectJSONArray: length mismatch, got %v want %v", len(rawSlice), length)
+			return
+		}
+
+		// Decode each item in rawSlice.
+		for i := range length {
+			erv := rv.Index(i)
+			ebz := rawSlice[i]
+			err = cdc.decodeReflectJSON(ebz, einfo, erv, fopts, anyDepth)
+			if err != nil {
+				return
+			}
+		}
+		return
+	}
+}
+
+// CONTRACT: rv.CanAddr() is true.
+func (cdc *Codec) decodeReflectJSONSlice(bz []byte, info *TypeInfo, rv reflect.Value, fopts FieldOptions, anyDepth int) (err error) {
+	if !rv.CanAddr() {
+		panic("rv not addressable")
+	}
+	if printLog {
+		fmt.Println("(d) decodeReflectJSONSlice")
+		defer func() {
+			fmt.Printf("(d) -> err: %v\n", err)
+		}()
+	}
+
+	ert := info.Type.Elem()
+
+	switch ert.Kind() {
+	case reflect.Uint8: // Special case: byte slice
+		err = json.Unmarshal(bz, rv.Addr().Interface())
+		if err != nil {
+			return
+		}
+		if rv.Len() == 0 {
+			// Special case when length is 0.
+			// NOTE: We prefer nil slices.
+			rv.Set(info.ZeroValue)
+		}
+		// else {
+		// NOTE: Already set via json.Unmarshal() above.
+		// }
+		return
+
+	default: // General case.
+		var einfo *TypeInfo
+		einfo, err = cdc.getTypeInfoWLock(ert)
+		if err != nil {
+			return
+		}
+
+		// Read into rawSlice.
+		var rawSlice []json.RawMessage
+		if err = json.Unmarshal(bz, &rawSlice); err != nil {
+			return
+		}
+
+		// Special case when rawSlice is nil.
+		// This happens when the JSON was 'null'.
+		if rawSlice == nil {
+			rv.Set(info.ZeroValue)
+		}
+
+		length := len(rawSlice)
+		// NOTE: While we prefer nil slices for binary decoding,
+		// we prefer empty slices for json "[]".
+		// This is also how json.Unmarshal() behaves.
+		// if length == 0 {
+		//	rv.Set(info.ZeroValue)
+		//	return
+		// }
+
+		// Read into a new slice.
+		esrt := reflect.SliceOf(ert) // TODO could be optimized.
+		srv := reflect.MakeSlice(esrt, length, length)
+		for i := range length {
+			erv := srv.Index(i)
+			ebz := rawSlice[i]
+			err = cdc.decodeReflectJSON(ebz, einfo, erv, fopts, anyDepth)
+			if err != nil {
+				return
+			}
+		}
+
+		// TODO do we need this extra step?
+		rv.Set(srv)
+		return
+	}
+}
+
+// CONTRACT: rv.CanAddr() is true.
+func (cdc *Codec) decodeReflectJSONStruct(bz []byte, info *TypeInfo, rv reflect.Value, fopts FieldOptions, anyDepth int) (err error) {
+	if !rv.CanAddr() {
+		panic("rv not addressable")
+	}
+	if printLog {
+		fmt.Println("(d) decodeReflectJSONStruct")
+		defer func() {
+			fmt.Printf("(d) -> err: %v\n", err)
+		}()
+	}
+
+	// Map all the fields(keys) to their blobs/bytes.
+	// NOTE: In decodeReflectBinaryStruct, we don't need to do this,
+	// since fields are encoded in order.
+	// We use a token-based decoder instead of json.Unmarshal to detect
+	// duplicate keys (matching the binary decoder's monotonic field check).
+	rawMap, err := unmarshalJSONObjectNoDuplicates(bz)
+	if err != nil {
+		return
+	}
+
+	for _, field := range info.Fields {
+		// Get field rv and info.
+		frv := rv.Field(field.Index)
+		finfo := field.TypeInfo
+
+		// Get value from rawMap.
+		valueBytes := rawMap[field.JSONName]
+		if len(valueBytes) == 0 {
+			// TODO: Since the Go stdlib's JSON codec allows case-insensitive
+			// keys perhaps we need to also do case-insensitive lookups here.
+			// So "Vanilla" and "vanilla" would both match to the same field.
+			// It is actually a security flaw with encoding/json library
+			// - See https://github.com/golang/go/issues/14750
+			// but perhaps we are aiming for as much compatibility here.
+			// JAE: I vote we depart from encoding/json, than carry a vuln.
+
+			// Set to the zero value only if not omitempty
+			if !field.JSONOmitEmpty {
+				// Set nil/zero on frv.
+				frv.Set(defaultValue(frv.Type()))
+			}
+
+			continue
+		}
+
+		// Decode into field rv.
+		err = cdc.decodeReflectJSON(valueBytes, finfo, frv, field.FieldOptions, anyDepth)
+		if err != nil {
+			return
+		}
+	}
+
+	// Reject unknown keys — collect known JSON names and check for extras.
+	known := make(map[string]bool, len(info.Fields))
+	for _, field := range info.Fields {
+		known[field.JSONName] = true
+	}
+	for key := range rawMap {
+		if !known[key] {
+			return fmt.Errorf("unknown JSON field %q for type %v", key, info.Type)
+		}
+	}
+
+	return nil
+}
+
+// ----------------------------------------
+// Misc.
+
+func extractJSONTypeURL(bz []byte) (typeURL string, value json.RawMessage, err error) {
+	// Decode with duplicate-key detection.
+	rawMap, err := unmarshalJSONObjectNoDuplicates(bz)
+	if err != nil {
+		err = fmt.Errorf("cannot parse Any JSON wrapper: %w", err)
+		return
+	}
+
+	// Get typeURL.
+	if typeBytes, ok := rawMap["@type"]; ok {
+		if err = json.Unmarshal(typeBytes, &typeURL); err != nil {
+			return
+		}
+	}
+	if typeURL == "" {
+		err = errors.New("JSON encoding of interfaces require non-empty @type field")
+		return
+	}
+	// NOTE: amino's JSON Any format inlines concrete-type fields alongside
+	// @type (not wrapped in a "value" field), so extra keys are expected.
+	value = rawMap["value"]
+	return
+}
+
+func deriveJSONObject(bz []byte, typeURL string) (res []byte, err error) {
+	str := string(bz)
+	if len(bz) == 0 {
+		err = errors.New("expected JSON object but was empty")
+		return
+	}
+	if !strings.HasPrefix(str, "{") {
+		err = fmt.Errorf("expected JSON object but was not: %s", bz)
+		return
+	}
+	str = strings.TrimLeft(str, " \t\r\n")
+	if !strings.HasPrefix(str, "{") {
+		err = fmt.Errorf("expected JSON object representing Any to start with '{', but got %v", string(bz))
+		return
+	}
+	str = str[1:]
+	str = strings.TrimLeft(str, " \t\r\n")
+	if !strings.HasPrefix(str, `"@type"`) {
+		err = fmt.Errorf("expected JSON object representing Any to start with \"@type\" field, but got %v", string(bz))
+		return
+	}
+	str = str[7:]
+	str = strings.TrimLeft(str, " \t\r\n")
+	if !strings.HasPrefix(str, ":") {
+		err = fmt.Errorf("expected JSON object representing Any to start with \"@type\" field, but got %v", string(bz))
+		return
+	}
+	str = str[1:]
+	str = strings.TrimLeft(str, " \t\r\n")
+	if !strings.HasPrefix(str, fmt.Sprintf(`"%v"`, typeURL)) {
+		err = fmt.Errorf("expected JSON object representing Any to start with \"@type\":\"%v\", but got %v", typeURL, string(bz))
+		return
+	}
+	str = str[2+len(typeURL):]
+	str = strings.TrimLeft(str, ",")
+	return []byte("{" + str), nil
+}
+
+// unmarshalJSONObjectNoDuplicates decodes a JSON object into a map,
+// rejecting duplicate keys. Go's encoding/json silently accepts duplicates
+// (last-wins), but amino's binary decoder rejects duplicate fields via its
+// monotonic field-number check, so JSON should match.
+func unmarshalJSONObjectNoDuplicates(bz []byte) (map[string]json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(bz))
+	t, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if d, ok := t.(json.Delim); !ok || d != '{' {
+		return nil, fmt.Errorf("expected '{', got %v", t)
+	}
+	result := make(map[string]json.RawMessage)
+	for dec.More() {
+		t, err = dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := t.(string)
+		if !ok {
+			return nil, fmt.Errorf("expected string key, got %T", t)
+		}
+		if _, exists := result[key]; exists {
+			return nil, fmt.Errorf("duplicate JSON key %q", key)
+		}
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return nil, err
+		}
+		result[key] = raw
+	}
+	// Consume closing '}'.
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func nullBytes(b []byte) bool {
+	return bytes.Equal(b, []byte(`null`))
+}
+
+func unquoteString(in string) (out string, err error) {
+	err = json.Unmarshal([]byte(in), &out)
+	return out, err
+}

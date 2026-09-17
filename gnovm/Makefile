@@ -1,0 +1,176 @@
+.PHONY: help
+help:
+	@echo "Available make commands:"
+	@cat Makefile | grep '^[a-z][^:]*:' | cut -d: -f1 | sort | sed 's/^/  /'
+
+# command to run dependency utilities, like goimports.
+rundep=go run -modfile ../misc/devdeps/go.mod
+
+########################################
+# Environment variables
+# You can overwrite any of the following by passing a different value on the
+# command line, ie. `CGO_ENABLED=1 make test`.
+
+# disable cgo by default. cgo requires some additional dependencies in some
+# cases, and is not strictly required by any tm2 code.
+CGO_ENABLED ?= 0
+export CGO_ENABLED
+# Force the Go toolchain to match the version in go.mod, so filetest
+# TypeCheckError messages match CI. Override with GOTOOLCHAIN=local to use
+# your local Go version instead.
+GOTOOLCHAIN ?= $(shell sed -n 's/^toolchain //p' ../go.mod)
+export GOTOOLCHAIN
+# test suite flags.
+GOTEST_FLAGS ?= -v -p 1 -timeout=30m
+# used to set the default GNOROOT. This helps on local development, as it sets
+# up GNOROOT to the supposed path of the Gno repository clone.
+GNOROOT_DIR ?= $(abspath $(lastword $(MAKEFILE_LIST))/../../)
+# We can't use '-trimpath' yet as amino use absolute path from call stack
+# to find some directory: see #1236
+GOBUILD_FLAGS ?= -ldflags "-X github.com/gnolang/gno/tm2/pkg/version.Version=$(VERSION) -X github.com/gnolang/gno/gnovm/pkg/gnoenv._GNOROOT=$(GNOROOT_DIR)"
+# file where to place cover profile; used for coverage commands which are
+# more complex than adding -coverprofile, like test.cmd.coverage.
+GOTEST_COVER_PROFILE ?= cmd-profile.out
+
+# user for gno version [branch].[N]+[hash]
+VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null || echo "$(shell git rev-parse --abbrev-ref HEAD).$(shell git rev-list --count HEAD)+$(shell git rev-parse --short HEAD)")
+
+########################################
+# Dev tools
+.PHONY: build
+build:
+	go build $(GOBUILD_FLAGS) -o build/gno ./cmd/gno
+
+.PHONY: install
+install:
+	go install $(GOBUILD_FLAGS) ./cmd/gno
+
+.PHONY: clean
+clean:
+	rm -rf build
+
+########################################
+# Dev tools
+.PHONY: lint
+lint:
+	$(rundep) github.com/golangci/golangci-lint/v2/cmd/golangci-lint run --config ../.github/golangci.yml ./...
+
+.PHONY: fmt
+fmt:
+	go fmt ./...
+	go run ./cmd/gno fmt -w ./stdlibs/... ./tests/stdlibs/... ./tests/files/...
+	$(rundep) golang.org/x/tools/cmd/goimports -w .
+
+########################################
+# Gas calibration analysis
+CALIBRATE_DIR := cmd/calibrate
+BENCH_DATA := $(CALIBRATE_DIR)/op_bench_do_dedicated.txt
+MACHINE_GO := pkg/gnolang/machine.go
+
+.PHONY: calibrate.analysis
+calibrate.analysis:
+	python3 $(CALIBRATE_DIR)/gen_analysis.py $(BENCH_DATA) $(MACHINE_GO)
+
+.PHONY: calibrate.plot
+calibrate.plot:
+	python3 $(CALIBRATE_DIR)/plot_fits.py $(BENCH_DATA) $(CALIBRATE_DIR)/op_gas_fits.png
+	@echo "Plot saved to $(CALIBRATE_DIR)/op_gas_fits.png"
+
+# Run allocation benchmarks and generate allocGasTable.
+.PHONY: calibrate.alloc
+calibrate.alloc:
+	@mkdir -p .tmp
+	go test -bench=BenchmarkAlloc -benchmem -count=5 -timeout=10m \
+		./$(CALIBRATE_DIR)/ | tee .tmp/alloc_bench.txt
+	python3 $(CALIBRATE_DIR)/gen_alloc_table.py .tmp/alloc_bench.txt
+
+# Full gas calibration: run op benchmarks, allocation benchmarks, and analysis.
+.PHONY: calibrate.gas
+calibrate.gas:
+	@echo "=== Running op handler benchmarks ==="
+	go test -tags benchmarkingops -bench=BenchmarkOp -benchmem -count=3 -timeout=30m \
+		./pkg/gnolang/ | tee $(CALIBRATE_DIR)/op_bench_local.txt
+	@echo "=== Running allocation benchmarks ==="
+	go test -bench=BenchmarkAlloc -benchmem -count=5 -timeout=10m \
+		./$(CALIBRATE_DIR)/ | tee $(CALIBRATE_DIR)/alloc_bench_local.txt
+	@echo "=== Generating analysis ==="
+	python3 $(CALIBRATE_DIR)/gen_analysis.py $(CALIBRATE_DIR)/op_bench_local.txt $(MACHINE_GO)
+	python3 $(CALIBRATE_DIR)/gen_alloc_table.py $(CALIBRATE_DIR)/alloc_bench_local.txt
+	@echo "=== Generating plots ==="
+	python3 $(CALIBRATE_DIR)/plot_fits.py $(CALIBRATE_DIR)/op_bench_local.txt $(CALIBRATE_DIR)/op_gas_fits_local.png
+	@echo ""
+	@echo "Calibration complete. Review the analysis output above."
+	@echo "Update constants in pkg/gnolang/machine.go and pkg/gnolang/alloc.go as needed."
+	@echo "Then run: go test ./pkg/gnolang/ -run TestFiles -test.short --update-golden-tests"
+
+########################################
+# Test suite
+.PHONY: test
+test: _test.filetest _test.cmd _test.pkg _test.stdlibs
+
+# Run tests with the debug build tag (enables debug checks).
+.PHONY: test.debug
+test.debug:
+	go test -tags debug ./pkg/... $(GOTEST_FLAGS)
+
+# Run tests with the debugAssert build tag (enables runtime invariant checks).
+.PHONY: test.debugAssert
+test.debugAssert:
+	go test -tags debugAssert ./pkg/... $(GOTEST_FLAGS)
+
+.PHONY: _test.cmd
+_test.cmd:
+	go test ./cmd/... $(GOTEST_FLAGS)
+
+# Run tests on ./cmd/, saving the result of the coverage in
+# GOTEST_COVER_PROFILE.
+.PHONY: test.cmd.coverage
+test.cmd.coverage:
+	$(eval export TXTARCOVERDIR := $(shell mktemp -d --tmpdir gnovm-make.XXXXXXX))
+	go test ./cmd/... -covermode atomic -test.gocoverdir='$(TXTARCOVERDIR)' $(GOTEST_FLAGS)
+	@echo "coverage results:"
+	go tool covdata percent -i="$(TXTARCOVERDIR)"
+	go tool covdata textfmt -v 1 -i="$(TXTARCOVERDIR)" -o '$(GOTEST_COVER_PROFILE)'
+	rm -rf "$(TXTARCOVERDIR)"
+
+# Run test.cmd.coverage, then view the result in the HTML browser render
+# and delete the original file.
+.PHONY: test.cmd.coverage_view
+test.cmd.coverage_view: test.cmd.coverage
+	go tool cover -html='$(GOTEST_COVER_PROFILE)'
+	rm '$(GOTEST_COVER_PROFILE)'
+
+.PHONY: _test.pkg
+_test.pkg:
+	go test ./pkg/... $(GOTEST_FLAGS)
+
+.PHONY: _test.stdlibs
+_test.stdlibs:
+	go test -v ./stdlibs/...
+	# 'gno test ./stdlibs/...' is different from TestStdlibs in 'go test ./pkg/..'
+	# TestStdlibs does not include tests from *_test packages.
+	cd stdlibs && go run ../cmd/gno test -v ./...
+
+
+.PHONY: _test.filetest
+_test.filetest:
+	@echo "use 'go test pkg/gnolang/files_test.go -test.short --update-golden-tests' to update filetest expectations"
+	go test pkg/gnolang/files_test.go -test.short -run 'TestFiles$$/' $(GOTEST_FLAGS)
+
+########################################
+# Code gen
+.PHONY: generate
+generate: _dev.generate _dev.docs fmt
+
+.PHONY: _dev.docs
+_dev.docs:
+	mkdir -p .tmp
+	(go run ./cmd/gno -h 2>&1 || true) | grep -v "exit status 1" > .tmp/gno-help.txt
+	$(rundep) github.com/campoy/embedmd -w `find . -name "*.md"`
+
+.PHONY: _dev.generate
+_dev.generate:
+	go generate -x ./...
+
+# genproto:
+# see top-level Makefile.

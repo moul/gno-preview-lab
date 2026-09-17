@@ -1,0 +1,2 @@
+module = "gno.vm/t/integ/main"
+gno = "0.9"

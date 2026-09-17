@@ -1,0 +1,195 @@
+package types
+
+import (
+	"io"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/gnolang/gno/tm2/pkg/crypto/merkle"
+	"github.com/gnolang/gno/tm2/pkg/random"
+)
+
+const (
+	testPartSize = 65536 // 64KB ...  4096 // 4KB
+)
+
+func TestBasicPartSet(t *testing.T) {
+	t.Parallel()
+
+	// Construct random data of size partSize * 100
+	data := random.RandBytes(testPartSize * 100)
+	partSet := NewPartSetFromData(data, testPartSize)
+
+	assert.NotEmpty(t, partSet.Hash())
+	assert.Equal(t, 100, partSet.Total())
+	assert.Equal(t, 100, partSet.BitArray().Size())
+	assert.True(t, partSet.HashesTo(partSet.Hash()))
+	assert.True(t, partSet.IsComplete())
+	assert.Equal(t, 100, partSet.Count())
+
+	// Test adding parts to a new partSet.
+	partSet2 := NewPartSetFromHeader(partSet.Header())
+
+	assert.True(t, partSet2.HasHeader(partSet.Header()))
+	for i := range partSet.Total() {
+		part := partSet.GetPart(i)
+		// t.Logf("\n%v", part)
+		added, err := partSet2.AddPart(part)
+		if !added || err != nil {
+			t.Errorf("Failed to add part %v, error: %v", i, err)
+		}
+	}
+	// adding part with invalid index
+	added, err := partSet2.AddPart(&Part{Index: 10000})
+	assert.False(t, added)
+	assert.Error(t, err)
+	// adding existing part
+	added, err = partSet2.AddPart(partSet2.GetPart(0))
+	assert.False(t, added)
+	assert.Nil(t, err)
+
+	assert.Equal(t, partSet.Hash(), partSet2.Hash())
+	assert.Equal(t, 100, partSet2.Total())
+	assert.True(t, partSet2.IsComplete())
+
+	// Reconstruct data, assert that they are equal.
+	data2Reader := partSet2.GetReader()
+	data2, err := io.ReadAll(data2Reader)
+	require.NoError(t, err)
+
+	assert.Equal(t, data, data2)
+}
+
+func TestWrongProof(t *testing.T) {
+	t.Parallel()
+
+	// Construct random data of size partSize * 100
+	data := random.RandBytes(testPartSize * 100)
+	partSet := NewPartSetFromData(data, testPartSize)
+
+	// Test adding a part with wrong data.
+	partSet2 := NewPartSetFromHeader(partSet.Header())
+
+	// Test adding a part with wrong trail.
+	part := partSet.GetPart(0)
+	part.Proof.Aunts[0][0] += byte(0x01)
+	added, err := partSet2.AddPart(part)
+	if added || err == nil {
+		t.Errorf("Expected to fail adding a part with bad trail.")
+	}
+
+	// Test adding a part with wrong bytes.
+	part = partSet.GetPart(1)
+	part.Bytes[0] += byte(0x01)
+	added, err = partSet2.AddPart(part)
+	if added || err == nil {
+		t.Errorf("Expected to fail adding a part with bad bytes.")
+	}
+}
+
+// TestAddPartSwappedIndex is a regression test for a Byzantine attack where a
+// peer sends a Part with part.Index != part.Proof.Index.  Because
+// SimpleProof.Verify uses Proof.Index internally, the merkle check passes even
+// though the bytes would be stored at the wrong slot, making the assembled
+// block undecodable.  AddPart must reject such parts before the merkle check.
+func TestAddPartSwappedIndex(t *testing.T) {
+	t.Parallel()
+
+	data := random.RandBytes(testPartSize * 3)
+	legitSet := NewPartSetFromData(data, testPartSize)
+	require.Equal(t, 3, legitSet.Total())
+
+	part0 := legitSet.GetPart(0)
+	part1 := legitSet.GetPart(1)
+
+	victimSet := NewPartSetFromHeader(legitSet.Header())
+
+	// Byzantine: send part1's proof+bytes but claim Index=0.
+	added, err := victimSet.AddPart(&Part{Index: 0, Bytes: part1.Bytes, Proof: part1.Proof})
+	assert.False(t, added)
+	assert.ErrorIs(t, err, ErrPartSetInvalidProof)
+
+	// Byzantine: send part0's proof+bytes but claim Index=1.
+	added, err = victimSet.AddPart(&Part{Index: 1, Bytes: part0.Bytes, Proof: part0.Proof})
+	assert.False(t, added)
+	assert.ErrorIs(t, err, ErrPartSetInvalidProof)
+}
+
+// TestAddPartWrongTotal checks that a Part whose proof carries a different
+// total than the PartSet is rejected.
+func TestAddPartWrongTotal(t *testing.T) {
+	t.Parallel()
+
+	data := random.RandBytes(testPartSize * 3)
+	legitSet := NewPartSetFromData(data, testPartSize)
+	require.Equal(t, 3, legitSet.Total())
+
+	part := legitSet.GetPart(0)
+	victimSet := NewPartSetFromHeader(legitSet.Header())
+
+	// Tamper the proof total.
+	part.Proof.Total = legitSet.Total() + 1
+	added, err := victimSet.AddPart(part)
+	assert.False(t, added)
+	assert.ErrorIs(t, err, ErrPartSetInvalidProof)
+}
+
+func TestPartSetHeaderValidateBasic(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		testName              string
+		malleatePartSetHeader func(*PartSetHeader)
+		expectErr             bool
+	}{
+		{"Good PartSet", func(psHeader *PartSetHeader) {}, false},
+		{"Negative Total", func(psHeader *PartSetHeader) { psHeader.Total = -2 }, true},
+		{"Invalid Hash", func(psHeader *PartSetHeader) { psHeader.Hash = make([]byte, 1) }, true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.testName, func(t *testing.T) {
+			t.Parallel()
+
+			data := random.RandBytes(testPartSize * 100)
+			ps := NewPartSetFromData(data, testPartSize)
+			psHeader := ps.Header()
+			tc.malleatePartSetHeader(&psHeader)
+			assert.Equal(t, tc.expectErr, psHeader.ValidateBasic() != nil, "Validate Basic had an unexpected result")
+		})
+	}
+}
+
+func TestPartValidateBasic(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		testName     string
+		malleatePart func(*Part)
+		expectErr    bool
+	}{
+		{"Good Part", func(pt *Part) {}, false},
+		{"Negative index", func(pt *Part) { pt.Index = -1 }, true},
+		{"Too big part", func(pt *Part) { pt.Bytes = make([]byte, BlockPartSizeBytes+1) }, true},
+		{"Too big proof", func(pt *Part) {
+			pt.Proof = merkle.SimpleProof{
+				Total:    1,
+				Index:    1,
+				LeafHash: make([]byte, 1024*1024),
+			}
+		}, true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.testName, func(t *testing.T) {
+			t.Parallel()
+
+			data := random.RandBytes(testPartSize * 100)
+			ps := NewPartSetFromData(data, testPartSize)
+			part := ps.GetPart(0)
+			tc.malleatePart(part)
+			assert.Equal(t, tc.expectErr, part.ValidateBasic() != nil, "Validate Basic had an unexpected result")
+		})
+	}
+}

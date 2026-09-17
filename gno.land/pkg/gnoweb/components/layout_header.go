@@ -1,0 +1,118 @@
+package components
+
+import (
+	"net/url"
+
+	"github.com/gnolang/gno/gno.land/pkg/gnoweb/weburl"
+)
+
+type HeaderLink struct {
+	Label    string
+	URL      string
+	Icon     string
+	IsActive bool
+	// Outbound, when set to one of the Outbound* constants, is rendered as
+	// data-outbound on the link so SimpleAnalytics fires a named
+	// outbound_<label> event instead of an anonymous outbound click.
+	Outbound string
+}
+
+type HeaderLinks struct {
+	General []HeaderLink
+	Dev     []HeaderLink
+}
+
+type HeaderData struct {
+	RealmPath  string
+	RealmURL   weburl.GnoURL
+	Breadcrumb BreadcrumbData
+	Links      HeaderLinks
+	ChainId    string
+	Remote     string
+	Mode       ViewMode
+	Static     bool
+}
+
+func StaticHeaderGeneralLinks() []HeaderLink {
+	return []HeaderLink{
+		{Label: "About", URL: "https://gno.land/about"},
+		{Label: "Docs", URL: "https://docs.gno.land/", Outbound: OutboundDocs},
+		{Label: "GitHub", URL: "https://github.com/gnolang", Outbound: OutboundGitHub},
+	}
+}
+
+func StaticHeaderDevLinks(u weburl.GnoURL, mode ViewMode, static bool) []HeaderLink {
+	contentURL, sourceURL, helpURL, stateURL := u, u, u, u
+	contentURL.WebQuery = url.Values{}
+	sourceURL.WebQuery = url.Values{"source": {""}}
+	helpURL.WebQuery = url.Values{"help": {""}}
+	stateURL.WebQuery = url.Values{"state": {""}}
+
+	contentLink := HeaderLink{
+		Label:    "Content",
+		URL:      contentURL.EncodeWebURL(),
+		Icon:     "ico-content",
+		IsActive: isActive(u.WebQuery, "Content"),
+	}
+
+	sourceLink := HeaderLink{
+		Label:    "Source",
+		URL:      sourceURL.EncodeWebURL(),
+		Icon:     "ico-code",
+		IsActive: isActive(u.WebQuery, "Source"),
+	}
+
+	actionsLink := HeaderLink{
+		Label:    "Actions",
+		URL:      helpURL.EncodeWebURL(),
+		Icon:     "ico-helper",
+		IsActive: isActive(u.WebQuery, "Actions"),
+	}
+
+	stateLink := HeaderLink{
+		Label:    "State",
+		URL:      stateURL.EncodeWebURL(),
+		Icon:     "ico-state",
+		IsActive: isActive(u.WebQuery, "State"),
+	}
+
+	switch {
+	case static:
+		return []HeaderLink{contentLink}
+	case mode == ViewModeExplorer:
+		return []HeaderLink{}
+	case mode == ViewModeUser:
+		return []HeaderLink{contentLink}
+	case mode == ViewModePackage:
+		return []HeaderLink{contentLink, sourceLink}
+	default:
+		return []HeaderLink{contentLink, stateLink, sourceLink, actionsLink}
+	}
+}
+
+func EnrichHeaderData(data HeaderData, mode ViewMode) HeaderData {
+	data.RealmPath = data.RealmURL.EncodeURL()
+	data.Links.Dev = StaticHeaderDevLinks(data.RealmURL, mode, data.Static)
+	data.Links.General = nil
+
+	if mode.ShouldShowGeneralLinks() {
+		data.Links.General = StaticHeaderGeneralLinks()
+	}
+
+	return data
+}
+
+func isActive(webQuery url.Values, label string) bool {
+	switch label {
+	case "Content":
+		return !webQuery.Has("source") && !webQuery.Has("help") && !webQuery.Has("state")
+	case "State":
+		return webQuery.Has("state")
+	case "Source":
+		return webQuery.Has("source")
+	case "Actions":
+		return webQuery.Has("help")
+	default:
+		return false
+	}
+}

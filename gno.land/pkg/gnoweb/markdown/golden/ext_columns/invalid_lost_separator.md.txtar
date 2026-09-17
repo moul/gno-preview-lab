@@ -1,0 +1,12 @@
+-- input.md --
+## bare-pipe is no longer a column separator
+|||
+
+## html tag log separator
+<gno-columns-sep />
+
+-- output.html --
+<h2>bare-pipe is no longer a column separator</h2>
+<p>|||</p>
+<h2>html tag log separator</h2>
+<!-- unexpected/invalid columns tag omitted -->

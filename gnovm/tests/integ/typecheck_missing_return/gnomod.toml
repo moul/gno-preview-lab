@@ -1,0 +1,2 @@
+module = "gno.vm/r/tests/integ/valid"
+gno = "0.9"

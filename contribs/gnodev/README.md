@@ -1,0 +1,188 @@
+# `gnodev`: Your Gno Development Companion
+
+`gnodev` is a robust tool designed to streamline your Gno package development process, enhancing productivity
+by providing immediate feedback on code changes.
+
+Please note that this is a quick overview. For a more detailed guide, refer to the official documentation at
+[docs/resources/gnodev.md](../../docs/resources/gnodev.md).
+
+## Synopsis
+
+**gnodev** [**local**|**staging**] [**flags**] [**package_dir ...**]
+
+## Features
+-  **In-Memory Node**: Gnodev starts an in-memory node, loading the workspace containing the current directory
+   at startup; **examples** packages are resolved on demand upon a query or transaction.
+-  **Web Interface Server**: Gnodev starts a `gnoweb` server on [`localhost:8888`](http://localhost:8888).
+-  **Balances and Keybase Customization**: Set account balances, load them from a file, or add new accounts via a flag.
+-  **Hot Reload**: Monitors loaded package directories for file changes, reloading the
+   package and automatically restarting the node as needed.
+-  **State Maintenance**: Ensures the previous node state is preserved by replaying all transactions.
+-  **Transaction Manipulation**: Allows for interactive cancellation and redoing of transactions.
+-  **State Export**: Export the current state at any time in a genesis doc format.
+
+## Commands
+While `gnodev` is running, trigger specific actions by pressing the following combinations:
+-  **H**: Display help information.
+-  **A**: Display account balances.
+-  **R**: Reload the node manually.
+-  **P**: Go to the previous transaction.
+-  **N**: Go to the next transaction.
+-  **Ctrl+S**: Save the current state.
+-  **E**: Export the current state to a genesis file.
+-  **Ctrl+R**: Reset the node to its initial (or saved) state.
+-  **Ctrl+C**: Exit `gnodev`.
+
+## Usage
+Run `gnodev` followed by any specific options and/or package directories. Packages from the **examples**
+directory are resolved on demand. Use `-no-examples` to prevent this.
+
+Example:
+```
+gnodev -add-account <bech32|name1>[=<amount1>] ./myrealm
+```
+
+### `gnodev -h`
+[embedmd]:# (.tmp/gnodev-usage.txt)
+```txt
+USAGE
+  gnodev <cmd> [flags] 
+
+The gnodev command starts an in-memory node and a gno.land
+web interface, primarily for realm package development.
+
+Currently gnodev comes with two mode <local> and <staging>, those command mostly
+differ by there default values, while gnodev local as default for working
+locally, satging default are oriented to be use on server.
+
+If no command is provided, gnodev will automatically start in <local> mode.
+
+For more information and flags usage description, use 'gnodev local -h'.
+
+SUBCOMMANDS
+  local    Start gnodev in local development mode (default)
+  staging  Start gnodev in staging mode
+
+```
+
+### `gnodev local -h`
+[embedmd]:# (.tmp/gnodev-local-usage.txt)
+```txt
+USAGE
+  gnodev local [flags] [package_dir...]
+
+LOCAL: Local mode configures the node for local development usage.
+This mode is optimized for realm development, providing an interactive and flexible environment.
+It enables features such as interactive mode, unsafe API access for testing, and lazy loading to improve performance.
+The log format is set to console for easier readability, and the web interface is accessible locally, making it ideal for iterative development and testing.
+
+By default, the workspace containing the current directory is loaded at startup;
+packages from "$GNOROOT/examples" are resolved on demand upon a query or transaction.
+
+
+FLAGS
+  -C ...	change directory context before running gnodev
+  -add-account ...	add (or set) a premine account in the form `<bech32|name>[=<amount>]`, can be used multiple time
+  -balance-file ...	load the provided balance file (refer to the documentation for format)
+  -chain-domain gno.land	set node ChainDomain
+  -chain-id dev	set node ChainID
+  -deploy-key g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5	default key name or Bech32 address for deploying packages
+  -empty-blocks=false 	enable creation of empty blocks (default: ~1s interval)
+  -empty-blocks-interval 1	set the interval for creating empty blocks (in seconds)
+  -extra-root ...	additional workspace root to include (repeatable); every package under it is eager-loaded
+  -genesis ...	load the given genesis file
+  -interactive=false 	enable gnodev interactive mode
+  -log-format console	log output format, can be `json` or `console`
+  -max-gas 10000000000	set the maximum gas per block
+  -no-examples=false 	skip loading $GNOROOT/examples entirely
+  -no-replay=false 	do not replay previous transactions upon reload
+  -no-watch=false 	do not watch for file changes
+  -no-web=false 	disable gnoweb
+  -node-rpc-listener 127.0.0.1:26657	listening address for GnoLand RPC node
+  -paths ...	additional package paths to preload in the form of "gno.land/r/my/realm", separated by commas
+  -remote ...	fetch packages of a chain domain from the given RPC, in the form `<domain>=<rpc>` (repeatable); domains without an entry are never fetched
+  -txs-file ...	load the provided transactions file (refer to the documentation for format)
+  -unsafe-api=true 	enable /reset and /reload endpoints which are not safe to expose publicly
+  -v=false 	enable verbose output for development
+  -web-analytics=false 	gnoweb: enable SimpleAnalytics tracking
+  -web-analytics-hostname ...	gnoweb: override the SimpleAnalytics reported hostname (rendered as data-hostname on the SA script tag)
+  -web-help-remote ...	gnoweb: web server help page's remote addr (default to <node-rpc-listener>)
+  -web-home ...	gnoweb: set default home page, use `/` or `:none:` to use default web home redirect
+  -web-html=false 	gnoweb: enable unsafe HTML parsing in markdown rendering
+  -web-listener 127.0.0.1:8888	gnoweb: web server listener address
+  -web-with-html=false 	gnoweb: enable HTML parsing in markdown rendering
+  -without-quarantined-examples=false 	skip loading $GNOROOT/examples/quarantined while keeping the rest of examples (also applies when examples is passed via -extra-root)
+
+```
+
+### `gnodev staging -h`
+[embedmd]:# (.tmp/gnodev-staging-usage.txt)
+```txt
+USAGE
+  gnodev staging [flags] [package_dir...]
+
+STAGING: Staging mode configures the node for server usage.
+This mode is designed for stability and security, suitable for pre-deployment testing.
+Interactive mode and unsafe API access are disabled to ensure a secure environment.
+The log format is set to JSON, facilitating integration with logging systems.
+Staging eager-loads the workspace, every -extra-root, and $GNOROOT/examples by default (use -no-examples to skip).
+
+Additionally, you can specify an additional package directory to load.
+
+
+FLAGS
+  -add-account ...	add (or set) a premine account in the form `<bech32|name>[=<amount>]`, can be used multiple time
+  -balance-file ...	load the provided balance file (refer to the documentation for format)
+  -chain-domain gno.land	set node ChainDomain
+  -chain-id dev	set node ChainID
+  -deploy-key g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5	default key name or Bech32 address for deploying packages
+  -empty-blocks=false 	enable creation of empty blocks (default: ~1s interval)
+  -empty-blocks-interval 1	set the interval for creating empty blocks (in seconds)
+  -extra-root ...	additional workspace root to include (repeatable); every package under it is eager-loaded
+  -genesis ...	load the given genesis file
+  -interactive=false 	enable gnodev interactive mode
+  -log-format json	log output format, can be `json` or `console`
+  -max-gas 10000000000	set the maximum gas per block
+  -no-examples=false 	skip loading $GNOROOT/examples entirely
+  -no-replay=false 	do not replay previous transactions upon reload
+  -no-watch=false 	do not watch for file changes
+  -no-web=false 	disable gnoweb
+  -node-rpc-listener 127.0.0.1:26657	listening address for GnoLand RPC node
+  -paths ...	additional package paths to preload in the form of "gno.land/r/my/realm", separated by commas
+  -remote ...	fetch packages of a chain domain from the given RPC, in the form `<domain>=<rpc>` (repeatable); domains without an entry are never fetched
+  -txs-file ...	load the provided transactions file (refer to the documentation for format)
+  -unsafe-api=false 	enable /reset and /reload endpoints which are not safe to expose publicly
+  -v=false 	enable verbose output for development
+  -web-analytics=false 	gnoweb: enable SimpleAnalytics tracking
+  -web-analytics-hostname ...	gnoweb: override the SimpleAnalytics reported hostname (rendered as data-hostname on the SA script tag)
+  -web-help-remote ...	gnoweb: web server help page's remote addr (default to <node-rpc-listener>)
+  -web-home :none:	gnoweb: set default home page, use `/` or `:none:` to use default web home redirect
+  -web-html=false 	gnoweb: enable unsafe HTML parsing in markdown rendering
+  -web-listener 127.0.0.1:8888	gnoweb: web server listener address
+  -web-with-html=false 	gnoweb: enable HTML parsing in markdown rendering
+  -without-quarantined-examples=true 	skip loading $GNOROOT/examples/quarantined while keeping the rest of examples (also applies when examples is passed via -extra-root)
+
+```
+
+### Transaction file format
+
+`gnodev` can sends genesis transactions to the local node using the `-txs-file` flag associated with the `-paths` and the `-add-account` flag.
+
+The transactions file attached to the `-txs-file` is a set of transaction, each wrapped by `"tx"`. A transaction can be generated by following the step 1, 2 and 3 from [Making an airgapped transaction](https://docs.gno.land/users/interact-with-gnokey/#making-an-airgapped-transaction).
+Here's an example of the format:
+```
+{"tx": {"msg":[{"@type":"/vm.m_call","caller":"g1us8428u2a5satrlxzagqqa5m6vmuze025anjlj","send":"","pkg_path":"gno.land/r/demo/counter","func":"Increment","args":[]}],"fee":{"gas_wanted":"2000000","gas_fee":"1000000ugnot"},"signatures":[{"pub_key":{"@type":"/tm.PubKeySecp256k1","value":"AmG6kzznyo1uNqWPAYU6wDpsmzQKDaEOrVRaZ08vOyX0"},"signature":""}],"memo":""}}
+{"tx": {"msg":[{"@type":"/vm.m_call","caller":"g1qpymzwx4l4cy6cerdyajp9ksvjsf20rk5y9rtt","send":"","pkg_path":"gno.land/r/demo/counter","func":"Increment","args":[]}],"fee":{"gas_wanted":"2000000","gas_fee":"1000000ugnot"},"signatures":[{"pub_key":{"@type":"/tm.PubKeySecp256k1","value":"A6yg5/iiktruezVw5vZJwLlGwyrvw8RlqOToTRMWXkE2"},"signature":""}],"memo":""}}
+{"tx": {"msg":[{"@type":"/vm.m_call","caller":"g1manfred47kzduec920z88wfr64ylksmdcedlf5","send":"","pkg_path":"gno.land/r/demo/counter","func":"Increment","args":[]}],"fee":{"gas_wanted":"2000000","gas_fee":"200000000ugnot"},"signatures":[{"pub_key":{"@type":"/tm.PubKeySecp256k1","value":"AnK+a6mcFDjY6b/v6p7r8QFW1M1PgIoQxBgrwOoyY7v3"},"signature":""}],"memo":""}}
+```
+
+
+## Related Tools
+
+### `gnobro`: Terminal UI for Realm Browsing
+`gnobro` is a terminal user interface (TUI) that allows you to browse realms within your terminal. It can automatically connect to `gnodev` for real-time development with hot reload capabilities and the ability to execute commands and interact with your realm.
+
+`gnobro` is available as a separate tool in the `contribs/gnobro` directory. For more information, see the [gnobro README](../gnobro/README.md).
+
+## Installation
+Run `make install` to install `gnodev`.

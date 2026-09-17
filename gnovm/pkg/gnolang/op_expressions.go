@@ -1,0 +1,875 @@
+package gnolang
+
+import (
+	"fmt"
+)
+
+// OpBinary1 defined in op_binary.go
+
+// NOTE: keep in sync with doOpIndex2.
+func (m *Machine) doOpIndex1() {
+	m.PopExpr()
+	iv := m.PopValue()   // index
+	xv := m.PeekValue(1) // x
+	switch ct := baseOf(xv.T).(type) {
+	case *MapType:
+		vt := ct.Value
+		if xv.V == nil { // uninitialized map
+			*xv = defaultTypedValue(m.Alloc, vt) // reuse as result
+		} else {
+			mv := xv.V.(*MapValue)
+			vv, exists := mv.GetValueForKey(m.GasMeter, m.Store, iv)
+			if exists {
+				*xv = vv // reuse as result
+			} else {
+				*xv = defaultTypedValue(m.Alloc, vt) // reuse as result
+			}
+		}
+	default:
+		if res, ok := xv.GetByteAtIndexInt(m.Store, int(iv.ConvertGetInt())); ok {
+			*xv = res // reuse as result
+			return
+		}
+		// Read-only: pass nilRealm so map key attach DidUpdate is a no-op.
+		res := xv.GetPointerAtIndex(m, nilRealm, m.Alloc, m.Store, iv)
+		*xv = res.Deref() // reuse as result
+	}
+}
+
+// NOTE: keep in sync with doOpIndex1.
+func (m *Machine) doOpIndex2() {
+	m.PopExpr()
+	iv := m.PeekValue(1) // index
+	xv := m.PeekValue(2) // x
+	switch ct := baseOf(xv.T).(type) {
+	case *MapType:
+		vt := ct.Value
+		if xv.V == nil { // uninitialized map
+			*xv = defaultTypedValue(m.Alloc, vt) // reuse as result
+			*iv = untypedBool(false)             // reuse as result
+		} else {
+			mv := xv.V.(*MapValue)
+			vv, exists := mv.GetValueForKey(m.GasMeter, m.Store, iv)
+			if exists {
+				*xv = vv                // reuse as result
+				*iv = untypedBool(true) // reuse as result
+			} else {
+				*xv = defaultTypedValue(m.Alloc, vt) // reuse as result
+				*iv = untypedBool(false)             // reuse as result
+			}
+		}
+	default:
+		panic("should not happen")
+	}
+}
+
+func (m *Machine) doOpSelector() {
+	sx := m.PopExpr().(*SelectorExpr)
+	xv := m.PeekValue(1) // the base .X -- package, struct, etc.
+	// Charge gas based on selector variant.
+	switch sx.Path.Type {
+	case VPInterface, VPDerefInterface:
+		// Interface dispatch cost scales with number of methods.
+		if it, ok := baseOf(xv.T).(*InterfaceType); ok {
+			m.incrCPU(OpCPUSelectorInterface + int64(len(it.Methods))*OpCPUSlopeSelectorIface)
+		} else {
+			m.incrCPU(OpCPUSelectorInterface)
+		}
+	case VPValMethod, VPDerefValMethod, VPPtrMethod, VPDerefPtrMethod:
+		m.incrCPU(OpCPUSelectorVPValMethod)
+	default:
+		m.incrCPU(OpCPUSelectorField)
+	}
+	res := xv.getPointerToFromTV(m.GasMeter, m.Alloc, m.Store, sx.Path, m.Package.PkgPath).Deref()
+	if debug {
+		m.Printf("-v[S] %v\n", xv)
+		m.Printf("+v[S] %v\n", res)
+	}
+	*xv = res // reuse as result
+}
+
+func (m *Machine) doOpSlice() {
+	sx := m.PopExpr().(*SliceExpr)
+	lowVal, highVal, maxVal := -1, -1, -1
+	// max
+	if sx.Max != nil {
+		maxVal = int(m.PopValue().ConvertGetInt())
+	}
+	// high
+	if sx.High != nil {
+		highVal = int(m.PopValue().ConvertGetInt())
+	}
+	// low
+	if sx.Low != nil {
+		lowVal = int(m.PopValue().ConvertGetInt())
+	} else {
+		lowVal = 0
+	}
+	// slice base x
+	xv := m.PopValue()
+	// if a is a pointer to an array, a[low : high : max] is
+	// shorthand for (*a)[low : high : max]
+	// XXX fix this in precompile instead.
+	if xv.T.Kind() == PointerKind &&
+		xv.T.Elem().Kind() == ArrayKind {
+		// simply deref xv.
+		if xv.V == nil {
+			m.pushPanic(typedRuntimeError("runtime error: nil pointer dereference"))
+			return
+		}
+		*xv = xv.V.(PointerValue).Deref()
+	}
+	// fill default based on xv
+	if sx.High == nil {
+		highVal = xv.GetLength()
+	}
+	// all low:high:max cases
+	if maxVal == -1 {
+		sv := xv.GetSlice(m.Alloc, lowVal, highVal)
+		m.PushValue(sv)
+	} else {
+		sv := xv.GetSlice2(m.Alloc, lowVal, highVal, maxVal)
+		m.PushValue(sv)
+	}
+}
+
+// If the referred value is undefined, and the pointer
+// elem kind is not an interface kind, the appropriate
+// type is set (and value becomes a typed-nil value).
+//
+// NOTE: OpStar is ambiguous -- it either means to
+// dereference a pointer value, or to refer to the referred
+// value in lhs, or it means to get the pointer-of a
+// type. The fact that the same symbol is used to refer to
+// both dereferencing (values) as well as referencing
+// (types) may be a confusing factor for those new to
+// C-like syntax. (it was for me).  We simply switch on the
+// type of *StarExpr.X.  Since pointers and typevals are
+// distinctly different kinds, the type-checker should
+// catch all potential ambiguities where the intent is to
+// deref, but the result is a pointer-to type.
+func (m *Machine) doOpStar() {
+	xv := m.PopValue()
+	switch bt := baseOf(xv.T).(type) {
+	case *PointerType:
+		if xv.V == nil {
+			m.pushPanic(typedRuntimeError("runtime error: nil pointer dereference"))
+			return
+		}
+
+		pv := xv.V.(PointerValue)
+		if pv.TV.T == DataByteType {
+			tv := TypedValue{T: bt.Elt}
+			dbv := pv.TV.V.(DataByteValue)
+			tv.SetUint8(dbv.GetByte())
+			m.PushValue(tv)
+		} else {
+			pvtv := *pv.TV
+			if xpt, ok := baseOf(xv.T).(*PointerType); ok {
+				// When a pointer was converted to a different
+				// declared pointer type, the dereferenced value
+				// should have the element type of the pointer,
+				// not the original stored type.
+				// e.g. type Foo struct{X int}; type Bar struct{X int};
+				// *((*Foo)(&Bar{})) is Foo, not Bar.
+				// But do not overwrite for interface element
+				// types; the concrete type must be preserved.
+				if xpt.Elem().Kind() != InterfaceKind {
+					pvtv.T = xpt.Elem()
+				}
+			}
+			m.PushValue(pvtv)
+		}
+	case *TypeType:
+		t := xv.GetType()
+		pt := &PointerType{Elt: t}
+		m.PushValue(asValue(pt))
+	default:
+		panic(fmt.Sprintf(
+			"illegal star expression x type %s",
+			xv.T.String()))
+	}
+}
+
+// doOpRef implements the & (address-of) operator.
+// The element type for the resulting pointer is taken from
+// ATTR_REF_ELEM_TYPE on the RefExpr, not from the runtime
+// xv.TV.T.  This distinction matters for interface variables:
+// var i interface{} = 42; &i must yield *interface{}, not *int.
+// ATTR_REF_ELEM_TYPE is set during preprocessing in
+// TRANS_LEAVE *RefExpr and at each synthetic RefExpr site.
+//
+// No size-dependent path here: zero-sized element types use the same
+// (Base, Index) route as any other. See PointerValue (values.go).
+func (m *Machine) doOpRef() {
+	rx := m.PopExpr().(*RefExpr)
+	xv, _ := m.PopAsPointer2(rx.X)
+	elt, ok := rx.GetAttribute(ATTR_REF_ELEM_TYPE).(Type)
+	if !ok {
+		panic("ATTR_REF_ELEM_TYPE not set during preprocessing")
+	}
+	m.Alloc.AllocatePointer()
+	m.PushValue(TypedValue{
+		T: m.Alloc.NewType(&PointerType{Elt: elt}),
+		V: xv,
+	})
+}
+
+// NOTE: keep in sync with doOpTypeAssert2.
+func (m *Machine) doOpTypeAssert1() {
+	m.PopExpr()
+	// pop type
+	t := m.PopValue().GetType() // type being asserted
+
+	// peek x for re-use
+	xv := m.PeekValue(1) // value result / value to assert
+	xt := xv.T           // underlying value's type
+
+	// xt may be nil, but we need to wait to return because the value of xt that is set
+	// will depend on whether we are trying to assert to an interface or concrete type.
+	// xt can be nil in the case where recover can't find a panic to recover from and
+	// returns a bare TypedValue{}.
+
+	if t.Kind() == InterfaceKind { // is interface assert
+		if xt == nil || xv.IsNilInterface() {
+			ex := fmt.Sprintf("interface conversion: interface is nil, not %s", t.String())
+			m.pushPanic(typedRuntimeError(ex))
+			return
+		}
+
+		if it, ok := baseOf(t).(*InterfaceType); ok {
+			// An interface type assertion on a value that doesn't have a concrete base
+			// type should always fail.
+			if _, ok := baseOf(xt).(*InterfaceType); ok {
+				// Non-concrete: fails without walking; per-method cost only.
+				// (The concrete path below is checked and charged inside
+				// checkImplementedBy — no double charge.)
+				m.incrCPU(OpCPUSlopeTypeAssertIface * int64(len(it.Methods)))
+				ex := fmt.Sprintf(
+					"non-concrete %s doesn't implement %s",
+					xt.String(),
+					it.String())
+				m.pushPanic(typedRuntimeError(ex))
+				return
+			}
+
+			// t is Gno interface.
+			// assert that x implements type (metered; see checkImplementedBy).
+			err := it.checkImplementedBy(m.GasMeter, xt)
+			if err != nil {
+				ex := fmt.Sprintf(
+					"%s doesn't implement %s (%s)",
+					xt.String(),
+					it.String(),
+					err.Error())
+				m.pushPanic(typedRuntimeError(ex))
+				return
+			}
+			// NOTE: consider ability to push an
+			// interface-restricted form
+			// *xv = *xv
+		} else {
+			panic("should not happen")
+		}
+	} else { // is concrete assert
+		if xt == nil {
+			ex := fmt.Sprintf("nil is not of type %s", t.String())
+			m.pushPanic(typedRuntimeError(ex))
+			return
+		}
+
+		tid := t.TypeID()
+		xtid := xt.TypeID()
+		// assert that x is of type.
+		same := tid == xtid
+		if !same {
+			ex := fmt.Sprintf(
+				"%s is not of type %s",
+				xt.String(),
+				t.String())
+			m.pushPanic(typedRuntimeError(ex))
+			return
+		}
+		// keep cxt as is.
+		// *xv = *xv
+	}
+}
+
+// NOTE: keep in sync with doOpTypeAssert1.
+func (m *Machine) doOpTypeAssert2() {
+	m.PopExpr()
+	// peek type for re-use
+	tv := m.PeekValue(1) // boolean result
+	t := tv.GetType()    // type being asserted
+
+	// peek x for re-use
+	xv := m.PeekValue(2) // value result / value to assert
+	xt := xv.T           // underlying value's type
+
+	// xt may be nil, but we need to wait to return because the value of xt that is set
+	// will depend on whether we are trying to assert to an interface or concrete type.
+	// xt can be nil in the case where recover can't find a panic to recover from and
+	// returns a bare TypedValue{}.
+
+	if t.Kind() == InterfaceKind { // is interface assert
+		if xt == nil {
+			*xv = TypedValue{}
+			*tv = untypedBool(false)
+			return
+		}
+
+		if it, ok := baseOf(t).(*InterfaceType); ok {
+			// An interface type assertion on a value that doesn't have a concrete base
+			// type should always fail.
+			if _, ok := baseOf(xt).(*InterfaceType); ok {
+				// Non-concrete: fails without walking; per-method cost only.
+				// (The concrete path below is checked and charged inside
+				// checkImplementedBy — no double charge.)
+				m.incrCPU(OpCPUSlopeTypeAssertIface * int64(len(it.Methods)))
+				*xv = TypedValue{}
+				*tv = untypedBool(false)
+				return
+			}
+
+			// t is Gno interface.
+			// assert that x implements type (metered; see checkImplementedBy).
+			impl := it.checkImplementedBy(m.GasMeter, xt) == nil
+			if impl {
+				// *xv = *xv
+				*tv = untypedBool(true)
+			} else {
+				// NOTE: consider ability to push an
+				// interface-restricted form
+				*xv = TypedValue{}
+				*tv = untypedBool(false)
+			}
+		} else {
+			panic("should not happen")
+		}
+	} else { // is concrete assert
+		if xt == nil {
+			*xv = defaultTypedValue(m.Alloc, t)
+			*tv = untypedBool(false)
+			return
+		}
+
+		tid := t.TypeID()
+		xtid := xt.TypeID()
+		// assert that x is of type.
+		same := tid == xtid
+
+		if same {
+			// *xv = *xv
+			*tv = untypedBool(true)
+		} else {
+			*xv = defaultTypedValue(m.Alloc, t)
+			*tv = untypedBool(false)
+		}
+	}
+}
+
+func (m *Machine) doOpCompositeLit() {
+	// composite lit expr
+	x := m.PeekExpr(1).(*CompositeLitExpr)
+	// composite type
+	t := m.PeekValue(1).V.(TypeValue).Type
+	// push elements
+	switch baseOf(t).(type) {
+	case *ArrayType:
+		m.PushOp(OpArrayLit)
+		// evaluate item values
+		for i := len(x.Elts) - 1; 0 <= i; i-- {
+			m.PushExpr(x.Elts[i].Value)
+			m.PushOp(OpEval)
+		}
+	case *SliceType:
+		if len(x.Elts) > 0 && x.Elts[0].Key != nil {
+			m.PushOp(OpSliceLit2)
+			// evaluate item values
+			for i := len(x.Elts) - 1; 0 <= i; i-- {
+				if x.Elts[i].Key == nil {
+					panic("slice composite literal cannot mix keyed and unkeyed elements")
+				}
+				m.PushExpr(x.Elts[i].Value)
+				m.PushOp(OpEval)
+				m.PushExpr(x.Elts[i].Key)
+				m.PushOp(OpEval)
+			}
+		} else {
+			m.PushOp(OpSliceLit)
+			// evaluate item values
+			for i := len(x.Elts) - 1; 0 <= i; i-- {
+				if x.Elts[i].Key != nil {
+					panic("slice composite literal cannot mix keyed and unkeyed elements")
+				}
+				m.PushExpr(x.Elts[i].Value)
+				m.PushOp(OpEval)
+			}
+		}
+	case *MapType:
+		m.PushOp(OpMapLit)
+		// evaluate map items
+		for i := len(x.Elts) - 1; 0 <= i; i-- {
+			// evaluate map value
+			m.PushExpr(x.Elts[i].Value)
+			m.PushOp(OpEval)
+			// evaluate map key
+			m.PushExpr(x.Elts[i].Key)
+			m.PushOp(OpEval)
+		}
+	case *StructType:
+		m.PushOp(OpStructLit)
+		// evaluate field values
+		for i := len(x.Elts) - 1; 0 <= i; i-- {
+			m.PushExpr(x.Elts[i].Value)
+			m.PushOp(OpEval)
+		}
+	default:
+		panic("not yet implemented")
+	}
+}
+
+func (m *Machine) doOpArrayLit() {
+	x := m.PopExpr().(*CompositeLitExpr)
+	ne := len(x.Elts)
+	m.incrCPU(OpCPUSlopeArrayLit * int64(ne))
+	// peek array type.
+	at := m.PeekValue(1 + ne).V.(TypeValue).Type
+	m.Alloc.checkConstructionTime(at)
+	bt := baseOf(at).(*ArrayType)
+	// construct array value.
+	av := defaultArrayValue(m.Alloc, bt)
+	if 0 < ne {
+		al, ad := av.List, av.Data
+		// al is a Go local until av is pushed below; anchor it so the
+		// element copies are counted as they are made (see doOpSliceLit).
+		// Data arrays hold no TypedValues and are allocated whole, so
+		// they need no anchor.
+		if al != nil {
+			m.Alloc.PushAnchor(al)
+			defer m.Alloc.PopAnchor()
+		}
+		vs := m.PopValues(ne)
+		set := make([]bool, bt.Len)
+		var idx int64
+		for i, v := range vs {
+			if kx := x.Elts[i].Key; kx != nil {
+				// XXX why convert?
+				k := kx.(*ConstExpr).ConvertGetInt()
+				if set[k] {
+					// array index has already been assigned
+					panic(fmt.Sprintf("duplicate index %d in array or slice literal", k))
+				}
+				set[k] = true
+				if al == nil {
+					ad[k] = v.GetUint8()
+				} else {
+					al[k] = v.Copy(m.Alloc)
+				}
+				idx = k + 1
+			} else {
+				if set[idx] {
+					// array index has already been assigned
+					panic(fmt.Sprintf("duplicate index %d in array or slice literal", idx))
+				}
+				set[idx] = true
+				if al == nil {
+					ad[idx] = v.GetUint8()
+				} else {
+					al[idx] = v.Copy(m.Alloc)
+				}
+				idx++
+			}
+		}
+	}
+	// pop array type.
+	if debug {
+		if m.PopValue().V.(TypeValue).Type != at {
+			panic("should not happen")
+		}
+	} else {
+		m.PopValue()
+	}
+	// push value
+	m.PushValue(TypedValue{
+		T: at,
+		V: av,
+	})
+}
+
+func (m *Machine) doOpSliceLit() {
+	x := m.PopExpr().(*CompositeLitExpr)
+	el := len(x.Elts)
+	m.incrCPU(OpCPUSlopeSliceLit * int64(el))
+	// peek slice type.
+	st := m.PeekValue(1 + el).V.(TypeValue).Type
+	m.Alloc.checkConstructionTime(st)
+	// construct element buf slice. SliceValue is anonymous (st is
+	// the SliceType); the inner ArrayValue.Base is allocated at
+	// currentRealmID. The construction-time check above already gated by st.
+	var baseArray *ArrayValue
+	if baseOf(st).(*SliceType).Elt.Kind() == Uint8Kind {
+		// Byte elements get a flat Data backing, matching
+		// defaultArrayValue, make([]byte,n) and append: 1 byte per
+		// element instead of a 40-byte TypedValue. Data holds no
+		// TypedValues and is allocated whole, so it needs no anchor
+		// (see doOpArrayLit).
+		baseArray = m.Alloc.NewDataArray(nil, el)
+		ad := baseArray.Data
+		for i, v := range m.PopValues(el) {
+			ad[i] = v.GetUint8()
+		}
+	} else {
+		baseArray = m.Alloc.NewListArray(nil, el)
+		// baseArray.List is a Go local until the slice below is pushed;
+		// anchor it so a GC triggered by one element's copy still counts
+		// the elements already copied into it.
+		m.Alloc.PushAnchor(baseArray.List)
+		defer m.Alloc.PopAnchor()
+		m.PopCopyValues(baseArray.List)
+	}
+	// construct and push value.
+	if debug {
+		if m.PopValue().V.(TypeValue).Type != st {
+			panic("should not happen")
+		}
+	} else {
+		m.PopValue()
+	}
+	sv := m.Alloc.NewSlice(baseArray, 0, el, el)
+	m.PushValue(TypedValue{
+		T: st,
+		V: sv,
+	})
+}
+
+func (m *Machine) doOpSliceLit2() {
+	x := m.PopExpr().(*CompositeLitExpr)
+	el := len(x.Elts)
+	tvs := m.PopValues(el * 2)
+	// peek slice type.
+	st := m.PeekValue(1).V.(TypeValue).Type
+	m.Alloc.checkConstructionTime(st)
+	// calculate maximum index.
+	var maxVal int64
+	for i := range el {
+		itv := tvs[i*2+0]
+		idx := itv.ConvertGetInt()
+		if idx > maxVal {
+			maxVal = idx
+		}
+	}
+	m.incrCPU(OpCPUSlopeSliceLit2 * (maxVal + 1))
+	// construct element buf slice.
+	// alloc before the underlying array constructed. Anonymous base
+	// array; nil t skips the construction-time check.
+	var baseArray *ArrayValue
+	if baseOf(st).(*SliceType).Elt.Kind() == Uint8Kind {
+		// Data holds no TypedValues and is allocated whole, so it needs
+		// no anchor (see doOpArrayLit).
+		baseArray = m.Alloc.NewDataArray(nil, int(maxVal+1))
+		ad := baseArray.Data
+		// Data elements are already zero, so IsDefined() cannot spot a
+		// duplicate index; track the keys instead. el is bounded by the
+		// number of elements written in source.
+		seen := make(map[int64]struct{}, el)
+		for i := range el {
+			idx := tvs[i*2+0].ConvertGetInt()
+			if _, dup := seen[idx]; dup {
+				panic(fmt.Sprintf("duplicate index %d in array or slice literal", idx))
+			}
+			seen[idx] = struct{}{}
+			ad[idx] = tvs[i*2+1].GetUint8()
+		}
+	} else {
+		baseArray = m.Alloc.NewListArray(nil, int(maxVal+1))
+		es := baseArray.List
+		// Anchor es for both fills below: the copies and the defaults are
+		// fresh allocations landing in a Go local (see doOpSliceLit).
+		m.Alloc.PushAnchor(es)
+		defer m.Alloc.PopAnchor()
+
+		for i := range el {
+			itv := tvs[i*2+0]
+			vtv := tvs[i*2+1]
+			idx := itv.ConvertGetInt()
+			if es[idx].IsDefined() {
+				// slice index has already been assigned
+				panic(fmt.Sprintf("duplicate index %d in array or slice literal", idx))
+			}
+			es[idx] = vtv.Copy(m.Alloc)
+		}
+		// fill in empty values.
+		ste := st.Elem()
+		for i, etv := range es {
+			if etv.IsUndefined() {
+				es[i] = defaultTypedValue(m.Alloc, ste)
+			}
+		}
+	}
+	// construct and push value.
+	if debug {
+		if m.PopValue().V.(TypeValue).Type != st {
+			panic("should not happen")
+		}
+	} else {
+		m.PopValue()
+	}
+	sv := m.Alloc.NewSlice(baseArray, 0, int(maxVal+1), int(maxVal+1))
+	m.PushValue(TypedValue{
+		T: st,
+		V: sv,
+	})
+}
+
+func (m *Machine) doOpMapLit() {
+	x := m.PopExpr().(*CompositeLitExpr)
+	ne := len(x.Elts)
+	m.incrCPU(OpCPUSlopeMapLit * int64(ne))
+	// peek map type.
+	mt := m.PeekValue(1 + ne*2).V.(TypeValue).Type
+	m.Alloc.checkConstructionTime(mt)
+	// bt := baseOf(at).(*MapType)
+	// construct new map value.
+	mv := m.Alloc.NewMap(mt)
+	if 0 < ne {
+		kvs := m.PopValues(ne * 2)
+		// mv is a Go local until it is pushed below, and every entry
+		// written into it is a fresh allocation — with the operands all
+		// aliasing one value ({0: a, 1: a, ...}) the popped sources are a
+		// single object while the copies grow N times. Anchor the map
+		// itself: its entries are a linked list, not a []TypedValue, so
+		// PushAnchor cannot express them. Anchoring after the pop is
+		// deliberate — pushing mv onto the operand stack instead would
+		// overwrite kvs[0], which PopValues left in place.
+		m.Alloc.PushAnchorValue(mv)
+		defer m.Alloc.PopAnchor()
+		// TODO: future optimization
+		// omitType := baseOf(mt).Elem().Kind() != InterfaceKind
+		for i := range ne {
+			ktv := kvs[i*2].Copy(m.Alloc)
+			vtv := kvs[i*2+1]
+			ptr := mv.GetPointerForKey(m.Alloc, m.GasMeter, m.Store, ktv)
+			*ptr.TV = vtv.Copy(m.Alloc)
+		}
+	}
+	// pop map type.
+	if debug {
+		if m.PopValue().GetType() != mt {
+			panic("should not happen")
+		}
+	} else {
+		m.PopValue()
+	}
+	// push value
+	m.PushValue(TypedValue{
+		T: mt,
+		V: mv,
+	})
+}
+
+func (m *Machine) doOpStructLit() {
+	x := m.PopExpr().(*CompositeLitExpr)
+	el := len(x.Elts) // may be incomplete
+	m.incrCPU(OpCPUSlopeStructLit * int64(el))
+	// peek struct type.
+	xt := m.PeekValue(1 + el).V.(TypeValue).Type
+	m.Alloc.checkConstructionTime(xt)
+	st := baseOf(xt).(*StructType)
+	nf := len(st.Fields)
+	// NOTE includes embedded fields.
+	// Allocate the field buffer before filling it and anchor it for the
+	// whole op: fs is a Go local until the struct is pushed at the end, so
+	// without the anchor the defaults and copies written into it are
+	// invisible to a GC triggered by a later field. See doOpSliceLit.
+	fs := m.Alloc.NewStructFields(nf)
+	m.Alloc.PushAnchor(fs)
+	if el == 0 {
+		// zero struct with no fields set.
+		// TODO: optimize and allow nil.
+		fillDefaultStructFields(m.Alloc, st, fs)
+	} else if x.Elts[0].Key == nil {
+		// field values are in order.
+		if debug {
+			if el == 0 {
+				// this is fine.
+			} else if el != nf {
+				panic("Unnamed composite literals must have exact number of fields")
+			} else {
+				// If there are any unexported fields and the
+				// package doesn't match, we cannot use this
+				// method to initialize the struct.
+				if st.hasInaccessibleUnexportedFields(m.Package.PkgPath) {
+					panic(fmt.Sprintf(
+						"Cannot initialize imported struct %s.%s with nameless composite lit expression (has unexported fields) from package %s",
+						st.PkgPath, st.String(), m.Package.PkgPath))
+				}
+				// else, this is fine.
+			}
+		}
+		m.PopCopyValues(fs)
+	} else {
+		// field values are by name and may be out of order.
+		fillDefaultStructFields(m.Alloc, st, fs)
+		fsset := make([]bool, len(fs))
+		ftvs := m.PopValues(el)
+		for i := range el {
+			fnx := x.Elts[i].Key.(*NameExpr)
+			ftv := ftvs[i]
+			if debug {
+				if fnx.Path.Depth != 0 {
+					panic("unexpected struct composite lit key path generation value")
+				}
+				if !ftv.IsUndefined() && ftv.T.Kind() == InterfaceKind {
+					panic("should not happen")
+				}
+			}
+			if fsset[fnx.Path.Index] {
+				// already set
+				panic(fmt.Sprintf("duplicate field name %s in struct literal", fnx.Name))
+			}
+			fsset[fnx.Path.Index] = true
+			fs[fnx.Path.Index] = ftv.Copy(m.Alloc)
+		}
+	}
+	// construct and push value.
+	m.PopValue() // baseOf() is st
+	sv := m.Alloc.NewStruct(xt, fs)
+	m.PushValue(TypedValue{
+		T: xt,
+		V: sv,
+	})
+	m.Alloc.PopAnchor()
+}
+
+func (m *Machine) doOpFuncLit() {
+	x := m.PopExpr().(*FuncLitExpr)
+	ft := m.PopValue().V.(TypeValue).Type.(*FuncType)
+	lb := m.LastBlock()
+	m.Alloc.AllocateFunc()
+	m.incrCPU(OpCPUSlopeFuncLit * int64(len(x.HeapCaptures)))
+
+	// First copy closure captured heap values
+	// to *FuncValue. Later during doOpCall a block
+	// will be created that copies these values for
+	// every invocation of the function.
+	captures := make([]TypedValue, 0, len(x.HeapCaptures))
+	if m.Stage == StagePre {
+		// TODO static block items aren't heap items.
+		// continue
+	} else {
+		for _, nx := range x.HeapCaptures {
+			ptr := lb.GetPointerToDirect(m.Store, nx.Path)
+			// check that ptr.TV is a heap item value.
+			// it must be in the form of:
+			// {T:heapItemType{},V:HeapItemValue{...}}
+			if _, ok := ptr.TV.T.(heapItemType); !ok {
+				panic("should not happen, should be heapItemType: " + nx.String())
+			}
+			if _, ok := ptr.TV.V.(*HeapItemValue); !ok {
+				panic("should not happen, should be heapItemValue: " + nx.String())
+			}
+			captures = append(captures, *ptr.TV)
+		}
+	}
+	fv := &FuncValue{
+		Type:       ft,
+		IsMethod:   false,
+		IsClosure:  true,
+		Source:     x,
+		Name:       "",
+		Parent:     nil,
+		Captures:   captures,
+		PkgPath:    m.Package.PkgPath,
+		Crossing:   ft.IsCrossing(),
+		body:       x.Body,
+		nativeBody: nil,
+	}
+	// Closures belong to wherever they were evaluated
+	// (currentRealmID), not their lexical PkgPath. FuncType has no
+	// declaring-realm semantics on its own — pass nil.
+	m.Alloc.stampPkgID(&fv.ObjectInfo, nil)
+	m.PushValue(TypedValue{
+		T: ft,
+		V: fv,
+	})
+}
+
+func (m *Machine) doOpConvert() {
+	xv := m.PopValue().Copy(m.Alloc)
+	t := m.PopValue().GetType()
+
+	// Gas based on conversion variant. Both directions allocate and copy,
+	// so they share the same flat cost; []byte→string additionally pays a
+	// per-byte slope below (string→[]byte's copy is covered by alloc gas).
+	if xv.T != nil && xv.T.Kind() == StringKind && t.Kind() == SliceKind {
+		m.incrCPU(OpCPUConvertStrBytes) // string -> []byte
+	} else if xv.T != nil && xv.T.Kind() == SliceKind && t.Kind() == StringKind {
+		m.incrCPU(OpCPUConvertStrBytes) // []byte -> string
+	} else {
+		m.incrCPU(OpCPUConvertNumeric)
+	}
+
+	// BEGIN conversion checks — protect against inter-realm
+	// conversion exploits.
+	//
+	// Case 1. Refuse conversion of a value whose underlying object is
+	// stored in an external realm. Without this, an attacker can
+	// declare a parallel /p/-type with the same struct layout as a
+	// /p/-typed victim field plus extra mutator methods, then convert
+	// the victim's pointer to the parallel type and invoke the new
+	// mutator — borrow rule 2 routes m.Realm to victim's realm for
+	// the duration of the /p/-method, so the write would succeed under
+	// victim authority. Blocking the conversion here (m.IsReadonly is
+	// the cross-realm ownership check) stops the launder before any
+	// method dispatch. See zrealm_launder_g_typepun.gno.
+	if xv.T != nil && !xv.T.IsImmutable() && m.IsReadonly(&xv) {
+		if xvdt, ok := xv.T.(*DeclaredType); ok &&
+			xvdt.PkgPath == m.Realm.Path {
+			// Except allow conversion when xv.T is m.Realm's own
+			// declared type — the converting realm already has
+			// write authority over its own values.
+		} else {
+			sliceType, ok := baseOf(xv.T).(*SliceType)
+			isBytesArray := ok && (sliceType.Elem().Kind() == Uint8Kind || sliceType.Elem().Kind() == Int32Kind)
+			if isBytesArray && t.Kind() == StringKind {
+				// Allow conversion from []byte to string
+				// As it does not modify the value stored in the slice.
+			} else {
+				panic("illegal conversion of readonly or externally stored value")
+			}
+		}
+	}
+
+	// Case 2. Refuse conversion to a foreign /r/-declared type — the
+	// converting realm cannot forge values of types it doesn't
+	// declare, otherwise it could fabricate "trusted" objects to
+	// hand back to the declaring realm.
+	if tdt, ok := t.(*DeclaredType); ok && !tdt.IsImmutable() && m.Realm != nil {
+		if IsRealmPath(tdt.PkgPath) && tdt.PkgPath != m.Realm.Path {
+			panic("illegal conversion to external realm type")
+		}
+	}
+
+	// Per-N CPU gas for parameterized conversions.
+	if xv.T != nil {
+		if xv.T.Kind() == StringKind {
+			// string → runes ([]int32)
+			if st, ok := baseOf(t).(*SliceType); ok && st.Elt.Kind() == Int32Kind {
+				m.incrCPU(OpCPUSlopeConvertStrRunes * int64(len(xv.GetString())))
+			}
+		} else if t.Kind() == StringKind {
+			if st, ok := baseOf(xv.T).(*SliceType); ok {
+				switch st.Elt.Kind() {
+				case Uint8Kind:
+					m.incrCPU(OpCPUSlopeConvertBytesStr * int64(xv.GetLength()))
+				case Int32Kind:
+					m.incrCPU(OpCPUSlopeConvertRunesStr * int64(xv.GetLength()))
+				}
+			}
+		}
+	}
+
+	ConvertTo(m.Alloc, m.Store, &xv, t, false)
+	m.PushValue(xv)
+}

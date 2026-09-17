@@ -1,0 +1,1091 @@
+package sdk
+
+import (
+	"fmt"
+	"io"
+	"log/slog"
+	"runtime/debug"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/gnolang/gno/tm2/pkg/amino"
+	abci "github.com/gnolang/gno/tm2/pkg/bft/abci/types"
+	bft "github.com/gnolang/gno/tm2/pkg/bft/types"
+	dbm "github.com/gnolang/gno/tm2/pkg/db"
+	"github.com/gnolang/gno/tm2/pkg/errors"
+	"github.com/gnolang/gno/tm2/pkg/std"
+	"github.com/gnolang/gno/tm2/pkg/store"
+	"github.com/gnolang/gno/tm2/pkg/store/trace"
+)
+
+// Key to store the consensus params in the main store.
+var (
+	mainConsensusParamsKey = []byte("consensus_params")
+	mainLastHeaderKey      = []byte("last_header")
+)
+
+// BaseApp reflects the ABCI application implementation.
+type BaseApp struct {
+	// initialized on creation
+	logger *slog.Logger
+	name   string                 // application name from abci.Info
+	db     dbm.DB                 // common DB backend
+	cms    store.CommitMultiStore // Main (uncached) state
+	router Router                 // handle any kind of message
+
+	// set upon LoadVersion or LoadLatestVersion.
+	baseKey store.StoreKey // Base Store in cms (raw db, not hashed)
+	mainKey store.StoreKey // Main Store in cms (e.g. iavl, merkle-ized)
+
+	anteHandler  AnteHandler  // ante handler for fee and auth
+	initChainer  InitChainer  // initialize state with validators and state blob
+	beginBlocker BeginBlocker // logic to run before any txs
+	endBlocker   EndBlocker   // logic to run after all txs, and to determine valset changes
+
+	beginTxHook BeginTxHook // BaseApp-specific hook run before running transaction messages.
+	endTxHook   EndTxHook   // BaseApp-specific hook run after running transaction messages.
+
+	// --------------------
+	// Volatile state
+	// checkState is set on initialization and reset on Commit.
+	// deliverState is set in InitChain and BeginBlock and cleared on Commit.
+	// See methods setCheckState and setDeliverState.
+	checkState   *state          // for CheckTx
+	deliverState *state          // for DeliverTx
+	voteInfos    []abci.VoteInfo // absent validators from begin block
+
+	// consensus params
+	// TODO: Move this in the future to baseapp param store on main store.
+	consensusParams *abci.ConsensusParams
+
+	// The minimum gas prices a validator is willing to accept for processing a
+	// transaction. This is mainly used for DoS and spam prevention.
+	minGasPrices []GasPrice
+
+	// Thread-safe snapshot of the last block header.
+	// Updated atomically in setCheckState().
+	// Used by Simulate and query handlers that run outside the consensus mutex.
+	lastBlockHeader atomic.Pointer[headerSnapshot]
+
+	// preCommitSimulateMu serialises Simulate's pre-commit path, the one case
+	// that has no committed version to snapshot and must read the mutable
+	// checkState. See BaseApp.Simulate.
+	preCommitSimulateMu sync.Mutex
+
+	// flag for sealing options and parameters to a BaseApp
+	sealed bool // TODO: needed?
+
+	// block height at which to halt the chain and gracefully shutdown
+	haltHeight uint64
+
+	// application's version string
+	appVersion string
+}
+
+var _ abci.Application = (*BaseApp)(nil)
+
+// NewBaseApp returns a reference to an initialized BaseApp. It accepts a
+// variadic number of option functions, which act on the BaseApp to set
+// configuration choices.
+//
+// NOTE: The db is used to store the version number for now.
+func NewBaseApp(
+	name string,
+	logger *slog.Logger,
+	db dbm.DB,
+	baseKey store.StoreKey,
+	mainKey store.StoreKey,
+	options ...func(*BaseApp),
+) *BaseApp {
+	app := &BaseApp{
+		logger:  logger,
+		name:    name,
+		db:      db,
+		cms:     store.NewCommitMultiStore(db),
+		router:  NewRouter(),
+		baseKey: baseKey,
+		mainKey: mainKey,
+	}
+	for _, option := range options {
+		option(app)
+	}
+
+	return app
+}
+
+// Name returns the name of the BaseApp.
+func (app *BaseApp) Name() string {
+	return app.name
+}
+
+// AppVersion returns the application's version string.
+func (app *BaseApp) AppVersion() string {
+	return app.appVersion
+}
+
+// Logger returns the logger of the BaseApp.
+func (app *BaseApp) Logger() *slog.Logger {
+	return app.logger
+}
+
+// MountStoreWithDB mounts a store to the provided key in the BaseApp
+// multistore, using a specified DB.
+func (app *BaseApp) MountStoreWithDB(key store.StoreKey, cons store.CommitStoreConstructor, db dbm.DB) {
+	app.cms.MountStoreWithDB(key, cons, db)
+}
+
+// MountStore mounts a store to the provided key in the BaseApp multistore,
+// using the default DB.
+func (app *BaseApp) MountStore(key store.StoreKey, cons store.CommitStoreConstructor) {
+	app.cms.MountStoreWithDB(key, cons, nil)
+}
+
+// LoadLatestVersion loads the latest application version. It will panic if
+// called more than once on a running BaseApp.
+// This, or LoadVersion() MUST be called even after first init.
+func (app *BaseApp) LoadLatestVersion() error {
+	err := app.cms.LoadLatestVersion()
+	if err != nil {
+		return err
+	}
+	return app.initFromMainStore()
+}
+
+// LoadVersion loads the BaseApp application version. It will panic if called
+// more than once on a running baseapp.
+// This, or LoadLatestVersion() MUST be called even after first init.
+func (app *BaseApp) LoadVersion(version int64) error {
+	err := app.cms.LoadVersion(version)
+	if err != nil {
+		return err
+	}
+	return app.initFromMainStore()
+}
+
+// LastCommitID returns the last CommitID of the multistore.
+func (app *BaseApp) LastCommitID() store.CommitID {
+	return app.cms.LastCommitID()
+}
+
+// LastBlockHeight returns the last committed block height.
+func (app *BaseApp) LastBlockHeight() int64 {
+	return app.cms.LastCommitID().Version
+}
+
+// initializes the app from app.cms after loading.
+func (app *BaseApp) initFromMainStore() error {
+	baseStore := app.cms.GetStore(app.baseKey)
+	if baseStore == nil {
+		return errors.New("baseapp expects MultiStore with 'base' Store")
+	}
+	mainStore := app.cms.GetStore(app.mainKey)
+	if mainStore == nil {
+		return errors.New("baseapp expects MultiStore with 'main' Store")
+	}
+
+	// Load the consensus params from the main store. If the consensus params are
+	// nil, it will be saved later during InitChain.
+	//
+	// assert that InitChain hasn't yet been called.
+	// the app.checkState will be set in InitChain.
+	// We assert that InitChain hasn't yet been called so
+	// we don't over write the consensus params in the app.
+	if app.checkState != nil {
+		panic("Consensus Params are already set in app, we should not overwrite it here")
+	}
+	consensusParamsBz := mainStore.Get(nil, mainConsensusParamsKey)
+	if consensusParamsBz != nil {
+		consensusParams := &abci.ConsensusParams{}
+		err := amino.Unmarshal(consensusParamsBz, consensusParams)
+		if err != nil {
+			panic(err)
+		}
+
+		app.setConsensusParams(consensusParams)
+	}
+
+	// Load the consensus header from the main store.
+	// This is needed to setCheckState with the right chainID etc.
+	lastHeaderBz := baseStore.Get(nil, mainLastHeaderKey)
+	if lastHeaderBz != nil {
+		lastHeader := &bft.Header{}
+		err := amino.Unmarshal(lastHeaderBz, lastHeader)
+		if err != nil {
+			panic(err)
+		}
+		app.setCheckState(lastHeader)
+	}
+
+	// Done.
+	app.Seal()
+
+	return nil
+}
+
+func (app *BaseApp) setMinGasPrices(gasPrices []GasPrice) {
+	app.minGasPrices = gasPrices
+}
+
+// Returns a read-only (cache) MultiStore.
+// This may be used by keepers for initialization upon restart.
+func (app *BaseApp) GetCacheMultiStore() store.MultiStore {
+	return app.cms.MultiCacheWrap()
+}
+
+// Router returns the router of the BaseApp.
+func (app *BaseApp) Router() Router {
+	if app.sealed {
+		// We cannot return a router when the app is sealed because we can't have
+		// any routes modified which would cause unexpected routing behavior.
+		panic("Router() on sealed BaseApp")
+	}
+	return app.router
+}
+
+// Seal seals a BaseApp. It prohibits any further modifications to a BaseApp.
+func (app *BaseApp) Seal() { app.sealed = true }
+
+// IsSealed returns true if the BaseApp is sealed and false otherwise.
+func (app *BaseApp) IsSealed() bool { return app.sealed }
+
+// setCheckState sets checkState with the cached multistore and
+// the context wrapping it.
+// It is called by InitChain() and Commit()
+func (app *BaseApp) setCheckState(header abci.Header) {
+	ms := app.cms.MultiCacheWrap()
+	app.checkState = &state{
+		ms:  ms,
+		ctx: NewContext(RunTxModeCheck, ms, header, app.logger).WithMinGasPrices(app.minGasPrices),
+	}
+	app.lastBlockHeader.Store(&headerSnapshot{header: header})
+}
+
+// setDeliverState sets deliverState with the cached multistore and
+// the context wrapping it.
+// It is called by InitChain() and BeginBlock(),
+// and deliverState is set nil on Commit().
+func (app *BaseApp) setDeliverState(header abci.Header) {
+	ms := app.cms.MultiCacheWrap()
+	app.deliverState = &state{
+		ms:  ms,
+		ctx: NewContext(RunTxModeDeliver, ms, header, app.logger),
+	}
+}
+
+// getLastBlockHeader returns the last block header, safe for concurrent access.
+// It reads from an atomic.Value updated in setCheckState() and BeginBlock().
+// Returns nil if no header has been set yet.
+func (app *BaseApp) getLastBlockHeader() abci.Header {
+	snap := app.lastBlockHeader.Load()
+	if snap != nil {
+		return snap.header
+	}
+	return nil
+}
+
+// setConsensusParams memoizes the consensus params.
+func (app *BaseApp) setConsensusParams(consensusParams *abci.ConsensusParams) {
+	app.consensusParams = consensusParams
+}
+
+// storeConsensusParams stores the consensus params to the main store.
+func (app *BaseApp) storeConsensusParams(consensusParams *abci.ConsensusParams) {
+	consensusParamsBz, err := amino.Marshal(consensusParams)
+	if err != nil {
+		panic(err)
+	}
+	mainStore := app.cms.GetStore(app.mainKey)
+	mainStore.Set(nil, mainConsensusParamsKey, consensusParamsBz)
+}
+
+// getMaximumBlockGas gets the maximum gas from the consensus params. It panics
+// if maximum block gas is less than negative one and returns zero if negative
+// one.
+func (app *BaseApp) getMaximumBlockGas() int64 {
+	if app.consensusParams == nil || app.consensusParams.Block == nil {
+		return 0
+	}
+
+	maxGas := app.consensusParams.Block.MaxGas
+	switch {
+	case maxGas < -1:
+		panic(fmt.Sprintf("invalid maximum block gas: %d", maxGas))
+
+	case maxGas == -1:
+		return 0
+
+	default:
+		return maxGas
+	}
+}
+
+// ----------------------------------------------------------------------------
+// ABCI
+
+// Info implements the ABCI interface.
+func (app *BaseApp) Info(req abci.RequestInfo) (res abci.ResponseInfo) {
+	lastCommitID := app.cms.LastCommitID()
+
+	res.Data = []byte(app.Name())
+	res.LastBlockHeight = lastCommitID.Version
+	res.LastBlockAppHash = lastCommitID.Hash
+	return
+}
+
+// SetOption implements the ABCI interface.
+func (app *BaseApp) SetOption(req abci.RequestSetOption) (res abci.ResponseSetOption) {
+	// TODO: Implement!
+	return
+}
+
+// InitChain implements the ABCI interface. It runs the initialization logic
+// directly on the CommitMultiStore.
+func (app *BaseApp) InitChain(req abci.RequestInitChain) (res abci.ResponseInitChain) {
+	// stash the consensus params in the cms main store and memoize
+	if req.ConsensusParams != nil {
+		app.setConsensusParams(req.ConsensusParams)
+		app.storeConsensusParams(req.ConsensusParams)
+	}
+
+	// Align multistore version with chain height for hardfork chains.
+	// After this, the next Commit() lands at version=req.InitialHeight, so
+	// app.LastBlockHeight() (cms.LastCommitID().Version) tracks real chain
+	// height with no offset bookkeeping.
+	if req.InitialHeight > 1 {
+		if setter, ok := app.cms.(store.InitialVersionSetter); ok {
+			setter.SetInitialVersion(req.InitialHeight)
+		}
+	}
+
+	initHeader := &bft.Header{ChainID: req.ChainID, Time: req.Time}
+
+	// initialize the deliver state and check state with a correct header
+	app.setDeliverState(initHeader)
+	app.setCheckState(initHeader)
+
+	if app.initChainer == nil {
+		return
+	}
+
+	// add block gas meter for any genesis transactions (allow infinite gas)
+	app.deliverState.ctx = app.deliverState.ctx.
+		WithBlockGasMeter(store.NewInfiniteGasMeter())
+
+	// Run the set chain initializer
+	res = app.initChainer(app.deliverState.ctx, req)
+
+	// If the initChainer returned an error response, return it as-is and
+	// skip the post-init bookkeeping below. The validators-count sanity
+	// check would otherwise panic with a misleading "count mismatch" when
+	// res.Validators is empty (the natural shape of an error response),
+	// masking the real cause from the operator.
+	if res.ResponseBase.Error != nil {
+		return
+	}
+
+	// sanity check
+	if len(req.Validators) > 0 {
+		if len(req.Validators) != len(res.Validators) {
+			panic(fmt.Errorf(
+				"len(RequestInitChain.Validators) != len(validators) (%d != %d)",
+				len(req.Validators), len(res.Validators)))
+		}
+		sort.Sort(abci.ValidatorUpdates(req.Validators))
+		sort.Sort(abci.ValidatorUpdates(res.Validators))
+		for i, val := range res.Validators {
+			if !val.Equals(req.Validators[i]) {
+				panic(fmt.Errorf("validators[%d] != req.Validators[%d] ", i, i))
+			}
+		}
+	}
+	// In app.initChainer(), we set the initial parameter values in the params keeper.
+	// The params keeper store needs to be accessible in the CheckTx state so that
+	// the first CheckTx can verify the gas price set right after the chain is initialized
+	// with the genesis state. Wrap the deliver state rather than aliasing it:
+	// CheckTx must READ genesis state, but its writes must never leak into
+	// the block-1 deliver state. Under the old aliasing, a pre-block-1
+	// CheckTx flushed its ante writes (fee deduction, sequence bumps — and
+	// at genesis height gno.land's ante even auto-creates funded accounts
+	// for unknown signers) into the shared store: the same tx then failed
+	// signature verification when delivered in block 1, and, worse, whether
+	// a CheckTx ran is per-node mempool state, so block-1 deliver state
+	// could diverge across nodes.
+	checkMS := app.deliverState.ms.MultiCacheWrap()
+	app.checkState.ctx.ms = checkMS
+	app.checkState.ms = checkMS
+
+	// NOTE: We don't commit, but BeginBlock for block 1 starts from this
+	// deliverState.
+	return
+}
+
+// Splits a string path using the delimiter '/'.
+// e.g. "this/is/funny" becomes []string{"this", "is", "funny"}
+func splitPath(requestPath string) (path []string) {
+	path = strings.Split(requestPath, "/")
+	// first element is empty string
+	if len(path) > 0 && path[0] == "" {
+		path = path[1:]
+	}
+	return path
+}
+
+// Query implements the ABCI interface. It delegates to CommitMultiStore if it
+// implements Queryable.
+func (app *BaseApp) Query(req abci.RequestQuery) (res abci.ResponseQuery) {
+	path := splitPath(req.Path)
+	if len(path) == 0 {
+		msg := "no query path provided"
+		res.Error = ABCIError(std.ErrUnknownRequest(msg))
+		return
+	}
+
+	switch path[0] {
+	// "/.app", "/.store" prefix for special application queries
+	case ".app":
+		return handleQueryApp(app, path, req)
+
+	case ".store":
+		return handleQueryStore(app, path, req)
+
+	// default router queries
+	default:
+		return handleQueryCustom(app, path, req)
+	}
+}
+
+func handleQueryApp(app *BaseApp, path []string, req abci.RequestQuery) (res abci.ResponseQuery) {
+	if len(path) >= 2 {
+		var result Result
+
+		switch path[1] {
+		case "simulate":
+			result = app.Simulate(req.Data)
+
+			res.Height = req.Height
+
+			bytes, err := amino.Marshal(result)
+			if err != nil {
+				res.Error = ABCIError(std.ErrInternal(fmt.Sprintf("cannot encode to JSON: %s", err)))
+			} else {
+				res.Value = bytes
+			}
+
+			return res
+		case "version":
+			res.Height = req.Height
+			res.Value = []byte(app.appVersion)
+			return res
+		default:
+			res.Error = ABCIError(std.ErrUnknownRequest(fmt.Sprintf("Unknown query: %s", path)))
+			return
+		}
+	} else {
+		res.Error = ABCIError(std.ErrUnknownRequest(fmt.Sprintf("Unknown query: %s", path)))
+		return
+	}
+}
+
+func handleQueryStore(app *BaseApp, path []string, req abci.RequestQuery) (res abci.ResponseQuery) {
+	// "/store" prefix for store queries
+	req.Path = "/" + strings.Join(path[1:], "/")
+
+	// when a client did not provide a query height, manually inject the latest
+	if req.Height == 0 {
+		req.Height = app.LastBlockHeight()
+	}
+
+	if req.Height <= 1 && req.Prove {
+		res.Error = ABCIError(std.ErrInternal("cannot query with proof when height <= 1; please provide a valid height"))
+		return
+	}
+
+	// Prefer the snapshot-isolated path: store queries run on the query ABCI
+	// connection, CONCURRENTLY with consensus commits, so they must not read
+	// live mutable store state when a snapshot view is available. On error
+	// (no committed state yet, pruned height, backend without a view at that
+	// height) fall through to the legacy live-query path, preserving its
+	// response surface for those corners — safe there because either nothing
+	// has been committed or the live path answers with its own
+	// version-existence handling, as today.
+	if iq, ok := app.cms.(store.ImmutableQueryer); ok {
+		resp, err := iq.QueryImmutable(req)
+		if err == nil {
+			resp.Height = req.Height
+			return resp
+		}
+		app.logger.Debug("store query snapshot path unavailable; using live path",
+			"height", req.Height, "err", err)
+	}
+
+	queryable, ok := app.cms.(store.Queryable)
+	if !ok {
+		msg := "multistore doesn't support queries"
+		res.Error = ABCIError(std.ErrUnknownRequest(msg))
+		return
+	}
+
+	resp := queryable.Query(req)
+	resp.Height = req.Height
+	return resp
+}
+
+func handleQueryCustom(app *BaseApp, path []string, req abci.RequestQuery) (res abci.ResponseQuery) {
+	if len(path) < 1 || path[0] == "" {
+		res.Error = ABCIError(std.ErrUnknownRequest("No route for custom query specified"))
+		return
+	}
+
+	handler := app.router.Route(path[0])
+	if handler == nil {
+		res.Error = ABCIError(std.ErrUnknownRequest(fmt.Sprintf("no custom handler found for route %s", path[0])))
+		return
+	}
+
+	// when a client did not provide a query height, manually inject the latest
+	if req.Height == 0 {
+		req.Height = app.LastBlockHeight()
+	}
+
+	if req.Height <= 1 && req.Prove {
+		res.Error = ABCIError(std.ErrInternal("cannot query with proof when height <= 1; please provide a valid height"))
+		return
+	}
+
+	cacheMS, release, err := app.cms.MultiImmutableCacheWrapWithVersion(req.Height)
+	if err != nil {
+		res.Error = ABCIError(std.ErrInternal(
+			fmt.Sprintf(
+				"failed to load state at height %d; %s (latest height: %d)",
+				req.Height, err, app.LastBlockHeight(),
+			),
+		))
+		return
+	}
+	defer release()
+
+	// cache wrap the commit-multistore for safety
+	// XXX RunTxModeQuery?
+	ctx := NewContext(RunTxModeCheck, cacheMS, app.getLastBlockHeader(), app.logger).WithMinGasPrices(app.minGasPrices)
+
+	// Passes the query to the handler.
+	res = handler.Query(ctx, req)
+	return
+}
+
+// BeginBlock implements the ABCI application interface.
+//
+// Block-height contiguity is the consensus engine's responsibility, not
+// BaseApp's. tm2/pkg/bft/state/validation.go (ValidateBlock) and the
+// BlockStore's SaveBlock contiguity check together guarantee that any
+// header reaching this method is height = lastBlockHeight + 1. BaseApp
+// intentionally does NOT re-check that invariant: duplicating it here
+// would mask consensus bugs as SDK panics, and after the InitialHeight
+// refactor (multistore version == chain height) every site that used to
+// translate offsets is gone, so a stateless check would either be wrong
+// or trivially redundant. Embedders driving BaseApp without a real
+// consensus engine (fuzzers, custom test harnesses) must enforce the
+// invariant themselves; see TestBeginBlock_NoStatelessContiguityGuard
+// in baseapp_test.go for the pinned behavior.
+func (app *BaseApp) BeginBlock(req abci.RequestBeginBlock) (res abci.ResponseBeginBlock) {
+	// Check if we should halt before processing this block.
+	// We halt at the beginning of the block *after* haltHeight,
+	// so the block at haltHeight is fully committed.
+	if app.haltHeight > 0 && uint64(req.Header.GetHeight()) > app.haltHeight {
+		panic(fmt.Sprintf("halt height %d reached, node shutting down", app.haltHeight))
+	}
+
+	// Initialize the DeliverTx state. If this is the first block, it should
+	// already be initialized in InitChain. Otherwise app.deliverState will be
+	// nil, since it is reset on Commit.
+	if app.deliverState == nil {
+		app.setDeliverState(req.Header)
+	} else {
+		// In the first block, app.deliverState.ctx will already be initialized
+		// by InitChain. Context is now updated with Header information.
+		app.deliverState.ctx = app.deliverState.ctx.
+			WithBlockHeader(req.Header)
+	}
+
+	// add block gas meter
+	var gasMeter store.GasMeter
+	if maxGas := app.getMaximumBlockGas(); maxGas > 0 {
+		gasMeter = store.NewGasMeter(maxGas)
+	} else {
+		gasMeter = store.NewInfiniteGasMeter()
+	}
+
+	app.deliverState.ctx = app.deliverState.ctx.WithBlockGasMeter(gasMeter)
+
+	if app.beginBlocker != nil {
+		res = app.beginBlocker(app.deliverState.ctx, req)
+	}
+
+	// set the signed validators for addition to context in deliverTx
+	if req.LastCommitInfo != nil {
+		app.voteInfos = req.LastCommitInfo.Votes
+	}
+	return
+}
+
+// CheckTx implements the ABCI interface. It runs the "basic checks" to see
+// whether or not a transaction can possibly be executed, first decoding and then
+// the ante handler (which checks signatures/fees/ValidateBasic).
+//
+// NOTE:CheckTx does not run the actual Msg handler function(s).
+func (app *BaseApp) CheckTx(req abci.RequestCheckTx) (res abci.ResponseCheckTx) {
+	ctx := app.getContextForTx(RunTxModeCheck, req.Tx)
+	result := app.runTx(ctx, req.Tx)
+	res.ResponseBase = result.ResponseBase
+	res.GasWanted = result.GasWanted
+	res.GasUsed = result.GasUsed
+	return
+}
+
+// DeliverTx implements the ABCI interface.
+func (app *BaseApp) DeliverTx(req abci.RequestDeliverTx) (res abci.ResponseDeliverTx) {
+	ctx := app.getContextForTx(RunTxModeDeliver, req.Tx)
+	result := app.runTx(ctx, req.Tx)
+	res.ResponseBase = result.ResponseBase
+	res.GasWanted = result.GasWanted
+	res.GasUsed = result.GasUsed
+	return
+}
+
+// validateBasicTxMsgs executes basic validator calls for messages.
+func validateBasicTxMsgs(msgs []Msg) error {
+	if len(msgs) == 0 {
+		return std.ErrUnknownRequest("Tx.GetMsgs() must return at least one message in list")
+	}
+
+	for _, msg := range msgs {
+		// Validate the Msg.
+		if err := msg.ValidateBasic(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// retrieve the context for the tx w/ txBytes and other memoized values.
+func (app *BaseApp) getContextForTx(mode RunTxMode, txBytes []byte) (ctx Context) {
+	ctx = app.getState(mode).ctx.
+		WithMode(mode).
+		WithTxBytes(txBytes).
+		WithVoteInfos(app.voteInfos).
+		WithConsensusParams(app.consensusParams)
+
+	// NOTE: This is especially required to simulate transactions because
+	// otherwise baseapp writes the antehandler mods (sequence and balance)
+	// to the underlying store for deliver and checktx.
+	if mode == RunTxModeSimulate {
+		ctx, _ = ctx.CacheContext()
+	}
+
+	return
+}
+
+// / runMsgs iterates through all the messages and executes them.
+func (app *BaseApp) runMsgs(ctx Context, msgs []Msg, mode RunTxMode) (result Result) {
+	ctx = ctx.WithEventLogger(NewEventLogger())
+
+	msgLogs := make([]string, 0, len(msgs))
+	msgInfos := make([]string, 0, len(msgs))
+	data := make([]byte, 0, len(msgs))
+
+	var (
+		err    error
+		events = []Event{}
+	)
+
+	// NOTE: GasWanted is determined by ante handler and GasUsed by the GasMeter.
+	for i, msg := range msgs {
+		// match message route
+		msgRoute := msg.Route()
+		handler := app.router.Route(msgRoute)
+		if handler == nil {
+			result.Error = ABCIError(std.ErrUnknownRequest("unrecognized message type: " + msgRoute))
+			return
+		}
+
+		var msgResult Result
+
+		// run the message!
+		// skip actual execution for CheckTx mode
+		if mode != RunTxModeCheck {
+			msgResult = handler.Process(ctx, msg) // ctx event logger being updated in handler
+		}
+
+		// Each message result's Data must be length prefixed in order to separate
+		// each result.
+		data = append(data, msgResult.Data...)
+		events = append(events, msgResult.Events...)
+		msgInfos = append(msgInfos, msgResult.Info)
+
+		// stop execution and return on first failed message
+		if !msgResult.IsOK() {
+			msgLogs = append(msgLogs,
+				fmt.Sprintf("msg:%d,success:%v,log:%s,events:%v",
+					i, false, msgResult.Log, events))
+			err = msgResult.Error
+			events = nil
+			break
+		}
+
+		msgLogs = append(msgLogs,
+			fmt.Sprintf("msg:%d,success:%v,log:%s,events:%v",
+				i, true, msgResult.Log, events))
+	}
+
+	if err == nil {
+		events = append(events, ctx.EventLogger().Events()...)
+	}
+
+	result.Error = ABCIError(err)
+	result.Data = data
+	result.Events = events
+	result.Info = strings.Join(msgInfos, "\n")
+	result.Log = strings.Join(msgLogs, "\n")
+	result.GasUsed = ctx.GasMeter().GasConsumed()
+	return result
+}
+
+// Returns the applications's deliverState if app is in RunTxModeDeliver,
+// otherwise it returns the application's checkstate.
+func (app *BaseApp) getState(mode RunTxMode) *state {
+	if mode == RunTxModeCheck || mode == RunTxModeSimulate {
+		return app.checkState
+	}
+
+	return app.deliverState
+}
+
+// cacheTxContext returns a new context based off of the provided context with
+// a cache wrapped multi-store.
+func (app *BaseApp) cacheTxContext(ctx Context) (Context, store.MultiStore) {
+	ms := ctx.MultiStore()
+	// TODO: https://github.com/cosmos/cosmos-sdk/issues/2824
+	msCache := ms.MultiCacheWrap()
+	return ctx.WithMultiStore(msCache), msCache
+}
+
+// runTx processes a transaction. The transactions is processed via an
+// anteHandler. The provided txBytes may be nil in some cases, eg. in tests. For
+// further details on transaction execution, reference the BaseApp SDK
+// documentation.
+func (app *BaseApp) runTx(ctx Context, txBytes []byte) (result Result) {
+	var (
+		// NOTE: GasWanted should be returned by the AnteHandler. GasUsed is
+		// determined by the GasMeter. We need access to the context to get the gas
+		// meter so we initialize upfront.
+		gasWanted int64
+		mode      = ctx.Mode()
+	)
+
+	if trace.StoreGasEnabled {
+		var modeName string
+		switch mode {
+		case RunTxModeCheck:
+			modeName = "check"
+		case RunTxModeSimulate:
+			modeName = "simulate"
+		case RunTxModeDeliver:
+			modeName = "deliver"
+		}
+		// GasWanted isn't known until after the ante handler unmarshals
+		// the tx and reads the fee; log 0 here as a placeholder.
+		trace.TxStart(modeName, 0)
+	}
+
+	if mode == RunTxModeDeliver {
+		// Wrap the gas meter in a passthrough that limits gas to the
+		// remaining block gas. This acts as a safety net for any gas
+		// charges before the ante handler's SetGasMeter replaces it
+		// with a per-tx basicGasMeter(GasWanted). After SetGasMeter,
+		// block gas is no longer enforced per-charge — it is checked
+		// post-hoc by the block gas meter defer below.
+		gasleft := ctx.BlockGasMeter().Remaining()
+		ctx = ctx.WithGasMeter(store.NewPassthroughGasMeter(
+			ctx.GasMeter(),
+			gasleft,
+		))
+	}
+
+	// only run the tx if there is block gas remaining
+	if mode == RunTxModeDeliver && ctx.BlockGasMeter().IsOutOfGas() {
+		result.Error = ABCIError(std.ErrOutOfGas("no block gas left to run tx"))
+		return
+	}
+
+	var startingGas int64
+	if mode == RunTxModeDeliver {
+		startingGas = ctx.BlockGasMeter().GasConsumed()
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			switch ex := r.(type) {
+			case store.OutOfGasError:
+				gasUsed := ctx.GasMeter().GasConsumed()
+				maxGas := int64(-1)
+				if cp := ctx.ConsensusParams(); cp != nil && cp.Block != nil {
+					maxGas = cp.Block.MaxGas
+				}
+				log := store.OutOfGasLog(gasUsed, gasWanted, maxGas, ex.Descriptor, true)
+				result.Error = ABCIError(std.ErrOutOfGas(log))
+				result.Log = log
+				result.GasWanted = gasWanted
+				result.GasUsed = gasUsed
+				if trace.StoreGasEnabled {
+					trace.TxEnd(result.GasUsed)
+				}
+				return
+			default:
+				// Defense in depth: clip in case `r` carries
+				// adversarial content from a code path that bypassed
+				// keeper-level bounding.
+				log := clipLog(fmt.Sprintf("recovered: %v\nstack:\n%v", r, string(debug.Stack())))
+				result.Error = ABCIError(std.ErrInternal(log))
+				result.Log = log
+				result.GasWanted = gasWanted
+				result.GasUsed = ctx.GasMeter().GasConsumed()
+				if trace.StoreGasEnabled {
+					trace.TxEnd(result.GasUsed)
+				}
+				return
+			}
+		}
+		// Whether AnteHandler panics or not.
+		result.GasWanted = gasWanted
+		result.GasUsed = ctx.GasMeter().GasConsumed()
+		if trace.StoreGasEnabled {
+			type debugMeter interface{ DebugTotals() (int64, int64) }
+			if m, ok := ctx.GasMeter().(debugMeter); ok {
+				c, r := m.DebugTotals()
+				trace.TxEndDebug(result.GasUsed, c, r)
+			} else {
+				trace.TxEnd(result.GasUsed)
+			}
+		}
+	}()
+
+	// Charge this tx's gas to the block gas meter. This is the post-hoc
+	// enforcement of the block gas limit — after the ante handler's
+	// SetGasMeter replaces the passthrough meter, block gas is no longer
+	// enforced per-charge. Instead, the tx's total gas is charged to the
+	// block meter here. If the block meter overflows, it panics.
+	//
+	// NOTE: This must exist in a separate defer function for the above
+	// recovery to recover from this one.
+	defer func() {
+		if mode == RunTxModeDeliver {
+			ctx.BlockGasMeter().ConsumeGas(
+				ctx.GasMeter().GasConsumedToLimit(),
+				"block gas meter",
+			)
+
+			if ctx.BlockGasMeter().GasConsumed() < startingGas {
+				panic(std.ErrGasOverflow("tx gas summation"))
+			}
+		}
+	}()
+
+	var tx Tx
+	if err := amino.Unmarshal(txBytes, &tx); err != nil {
+		result.Error = ABCIError(std.ErrTxDecode(err.Error()))
+		return
+	}
+
+	msgs := tx.GetMsgs()
+	if err := validateBasicTxMsgs(msgs); err != nil {
+		result.Error = ABCIError(err)
+		return
+	}
+
+	// Single cache wrap for the entire transaction (ante + msgs).
+	// This avoids redundant IAVL reads between ante and msg phases.
+	// See gno.land/adr/BASEAPPCACHE.md for design details.
+	var msCache store.MultiStore
+
+	if app.anteHandler != nil {
+		var anteCtx Context
+		anteCtx, msCache = app.cacheTxContext(ctx)
+		newCtx, result, abort := app.anteHandler(anteCtx, tx, mode == RunTxModeSimulate)
+		if newCtx.IsZero() {
+			panic("newCtx must not be zero")
+		}
+		if abort && result.Error == nil {
+			panic("result.Error should be set for abort")
+		}
+		if abort {
+			return result
+		}
+		// Carry forward ante handler's context (gas meter, params, etc.)
+		// but keep the same cache-wrapped multistore (no revert).
+		ctx = newCtx
+		gasWanted = result.GasWanted
+	}
+
+	// CheckTx: flush ante writes (sequence, fees) and return.
+	// No msg execution happens (handler.Process is skipped for CheckTx).
+	if mode == RunTxModeCheck {
+		if msCache != nil {
+			msCache.MultiWrite()
+		}
+		return result
+	}
+
+	// DeliverTx and Simulate: checkpoint ante state, then execute msgs.
+	// On DeliverTx failure/panic, WriteCheckpoint flushes only ante writes.
+	if msCache == nil {
+		// No ante handler — create cache wrap for msgs only.
+		ctx, msCache = app.cacheTxContext(ctx)
+	}
+	cp := msCache.(store.Checkpointable)
+	cp.Checkpoint()
+
+	// Flush ante writes on DeliverTx panic (e.g., OutOfGasError).
+	// Registered after existing defers so it runs first (LIFO).
+	defer func() {
+		if mode == RunTxModeDeliver && cp.HasCheckpoint() {
+			cp.WriteCheckpoint()
+		}
+	}()
+
+	runMsgCtx := ctx
+	if app.beginTxHook != nil {
+		runMsgCtx = app.beginTxHook(runMsgCtx)
+	}
+
+	result = app.runMsgs(runMsgCtx, msgs, mode)
+	result.GasWanted = gasWanted
+
+	// Simulate: return after msg execution. The outer CacheContext
+	// (from getContextForTx) discards everything.
+	if mode != RunTxModeDeliver {
+		return result
+	}
+
+	if app.endTxHook != nil {
+		app.endTxHook(runMsgCtx, result)
+	}
+
+	if result.IsOK() {
+		msCache.MultiWrite()
+	} else {
+		cp.WriteCheckpoint()
+	}
+
+	return result
+}
+
+// EndBlock implements the ABCI interface.
+func (app *BaseApp) EndBlock(req abci.RequestEndBlock) (res abci.ResponseEndBlock) {
+	if app.endBlocker != nil {
+		// we need to load consensusParams to the end blocker Context
+		// end blocker use consensusParams to calculat the gas price changes.
+		ctx := app.deliverState.ctx.WithConsensusParams(app.consensusParams)
+		res = app.endBlocker(ctx, req)
+	}
+
+	return
+}
+
+// Commit implements the ABCI interface. It will commit all state that exists in
+// the deliver state's multi-store and includes the resulting commit ID in the
+// returned abci.ResponseCommit. Commit will set the check state based on the
+// latest header and reset the deliver state. Also, if a non-zero halt height is
+// defined in config, Commit will execute a deferred function call to check
+// against that height and gracefully halt if it matches the latest committed
+// height.
+func (app *BaseApp) Commit() (res abci.ResponseCommit) {
+	header := app.deliverState.ctx.BlockHeader()
+
+	// Write block header into the deliver cache before flush,
+	// so it lands in the same batch as all other block state.
+	baseStore := app.deliverState.ms.GetStore(app.baseKey)
+	if baseStore == nil {
+		res.Error = ABCIError(errors.New("baseapp expects MultiStore with 'base' Store"))
+		return
+	}
+	headerBz := amino.MustMarshal(header)
+	baseStore.Set(nil, mainLastHeaderKey, headerBz)
+
+	// Write the DeliverTx state which is cache-wrapped and commit the MultiStore.
+	// The write to the DeliverTx state writes all state transitions to the root
+	// MultiStore (app.cms) so when Commit() is called it persists those values.
+	//
+	// Order matters: MultiWrite MUST precede Commit — reversing it makes IAVL
+	// SaveVersion run against a stale tree (wrong app hash) and shifts dbadapter
+	// writes into the next block's batch.
+	app.deliverState.ms.MultiWrite()
+	commitID := app.cms.Commit()
+	app.logger.Debug("Commit synced", "commit", fmt.Sprintf("%X", commitID))
+
+	// Reset the Check state to the latest committed.
+	//
+	// NOTE: This is safe because Tendermint holds a lock on the mempool for
+	// Commit. Use the header from this latest block.
+	app.setCheckState(header)
+
+	// empty/reset the deliver state
+	app.deliverState = nil
+
+	// return.
+	res.Data = commitID.Hash
+
+	return
+}
+
+// SetHaltHeight sets the block height at which the node will halt after committing.
+func (app *BaseApp) SetHaltHeight(height uint64) {
+	app.haltHeight = height
+}
+
+func (app *BaseApp) Close() error {
+	if app.db == nil {
+		return nil
+	}
+
+	// Release any open query snapshot before closing the DB.
+	// The multiStore holds a snapshot with refs=1 that is normally released by
+	// the next Commit(). On shutdown that swap never happens, so we must drain
+	// it explicitly; otherwise PebbleDB reports "leaked snapshots" at Close time.
+	// any inflight query ongoing during shutdown will fail as the snapshot is released.
+	if closer, ok := app.cms.(io.Closer); ok {
+		closer.Close() //nolint:errcheck // multiStore.Close() always returns nil
+	}
+
+	app.logger.Info("Closing application.db")
+
+	if err := app.db.Close(); err != nil {
+		return fmt.Errorf("unable to gracefully close DB: %w", err)
+	}
+
+	return nil
+}
+
+// ----------------------------------------------------------------------------
+// State
+
+type state struct {
+	ms  store.MultiStore
+	ctx Context
+}
+
+// headerSnapshot wraps an abci.Header for safe use with atomic.Value,
+// which requires a consistent concrete type on every Store call.
+type headerSnapshot struct {
+	header abci.Header
+}
+
+func (st *state) MultiCacheWrap() store.MultiStore {
+	return st.ms.MultiCacheWrap()
+}
+
+func (st *state) Context() Context {
+	return st.ctx
+}

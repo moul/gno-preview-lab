@@ -1,0 +1,290 @@
+package main
+
+import (
+	"flag"
+
+	"github.com/gnolang/gno/tm2/pkg/commands"
+)
+
+type AppConfig struct {
+	// Listeners
+	nodeRPCListenerAddr      string
+	nodeP2PListenerAddr      string
+	nodeProxyAppListenerAddr string
+
+	// Users default
+	deployKey       string
+	home            string
+	root            string
+	premineAccounts varPremineAccounts
+
+	// Files
+	balancesFile string
+	genesisFile  string
+	txsFile      string
+
+	// Web Configuration
+	noWeb                bool
+	webHTML              bool
+	webListenerAddr      string
+	webRemoteHelperAddr  string
+	webWithHTML          bool
+	webHome              string
+	webAnalytics         bool
+	webAnalyticsHostname string
+
+	// Loader
+	noExamples                 bool
+	withoutQuarantinedExamples bool
+	extraRoots                 []string
+	remotes                    map[string]string
+
+	// Node Configuration
+	logFormat           string
+	staging             bool
+	noWorkspaceHint     string // mode's loading consequence in the no-workspace banner; not a flag
+	verbose             bool
+	noWatch             bool
+	noReplay            bool
+	maxGas              int64
+	chainId             string
+	chainDomain         string
+	unsafeAPI           bool
+	interactive         bool
+	paths               string
+	emptyBlocks         bool
+	emptyBlocksInterval int64
+}
+
+func (c *AppConfig) RegisterFlagsWith(fs *flag.FlagSet, defaultCfg AppConfig) {
+	*c = defaultCfg // Copy default config
+
+	fs.StringVar(
+		&c.home,
+		"home",
+		defaultCfg.home,
+		"user's local directory for keys",
+	)
+
+	fs.BoolVar(
+		&c.interactive,
+		"interactive",
+		defaultCfg.interactive,
+		"enable gnodev interactive mode",
+	)
+
+	fs.StringVar(
+		&c.root,
+		"root",
+		defaultCfg.root,
+		"gno root directory",
+	)
+
+	fs.BoolVar(
+		&c.noWeb,
+		"no-web",
+		defaultLocalAppConfig.noWeb,
+		"disable gnoweb",
+	)
+
+	fs.BoolVar(
+		&c.webHTML,
+		"web-html",
+		defaultLocalAppConfig.webHTML,
+		"gnoweb: enable unsafe HTML parsing in markdown rendering",
+	)
+
+	fs.StringVar(
+		&c.webListenerAddr,
+		"web-listener",
+		defaultCfg.webListenerAddr,
+		"gnoweb: web server listener address",
+	)
+
+	fs.StringVar(
+		&c.webRemoteHelperAddr,
+		"web-help-remote",
+		defaultCfg.webRemoteHelperAddr,
+		"gnoweb: web server help page's remote addr (default to <node-rpc-listener>)",
+	)
+
+	fs.BoolVar(
+		&c.webWithHTML,
+		"web-with-html",
+		defaultCfg.webWithHTML,
+		"gnoweb: enable HTML parsing in markdown rendering",
+	)
+
+	fs.StringVar(
+		&c.webHome,
+		"web-home",
+		defaultCfg.webHome,
+		"gnoweb: set default home page, use `/` or `:none:` to use default web home redirect",
+	)
+
+	fs.BoolVar(
+		&c.noExamples,
+		"no-examples",
+		defaultCfg.noExamples,
+		"skip loading $GNOROOT/examples entirely",
+	)
+
+	fs.BoolVar(
+		&c.webAnalytics,
+		"web-analytics",
+		defaultCfg.webAnalytics,
+		"gnoweb: enable SimpleAnalytics tracking",
+	)
+
+	fs.StringVar(
+		&c.webAnalyticsHostname,
+		"web-analytics-hostname",
+		defaultCfg.webAnalyticsHostname,
+		"gnoweb: override the SimpleAnalytics reported hostname (rendered as data-hostname on the SA script tag)",
+	)
+
+	fs.BoolVar(
+		&c.withoutQuarantinedExamples,
+		"without-quarantined-examples",
+		defaultCfg.withoutQuarantinedExamples,
+		"skip loading $GNOROOT/examples/quarantined while keeping the rest of examples (also applies when examples is passed via -extra-root)",
+	)
+
+	fs.Var(
+		(*commands.StringArr)(&c.extraRoots),
+		"extra-root",
+		"additional workspace root to include (repeatable); every package under it is eager-loaded",
+	)
+
+	fs.Var(
+		(*remoteArr)(&c.remotes),
+		"remote",
+		"fetch packages of a chain domain from the given RPC, in the form `<domain>=<rpc>` (repeatable); domains without an entry are never fetched",
+	)
+
+	fs.StringVar(
+		&c.nodeRPCListenerAddr,
+		"node-rpc-listener",
+		defaultCfg.nodeRPCListenerAddr,
+		"listening address for GnoLand RPC node",
+	)
+
+	fs.Var(
+		&c.premineAccounts,
+		"add-account",
+		"add (or set) a premine account in the form `<bech32|name>[=<amount>]`, can be used multiple time",
+	)
+
+	fs.StringVar(
+		&c.balancesFile,
+		"balance-file",
+		defaultCfg.balancesFile,
+		"load the provided balance file (refer to the documentation for format)",
+	)
+
+	fs.StringVar(
+		&c.txsFile,
+		"txs-file",
+		defaultCfg.txsFile,
+		"load the provided transactions file (refer to the documentation for format)",
+	)
+
+	fs.StringVar(
+		&c.genesisFile,
+		"genesis",
+		defaultCfg.genesisFile,
+		"load the given genesis file",
+	)
+
+	fs.StringVar(
+		&c.deployKey,
+		"deploy-key",
+		defaultCfg.deployKey,
+		"default key name or Bech32 address for deploying packages",
+	)
+
+	fs.StringVar(
+		&c.chainId,
+		"chain-id",
+		defaultCfg.chainId,
+		"set node ChainID",
+	)
+
+	fs.StringVar(
+		&c.chainDomain,
+		"chain-domain",
+		defaultCfg.chainDomain,
+		"set node ChainDomain",
+	)
+
+	fs.BoolVar(
+		&c.noWatch,
+		"no-watch",
+		defaultCfg.noWatch,
+		"do not watch for file changes",
+	)
+
+	fs.BoolVar(
+		&c.noReplay,
+		"no-replay",
+		defaultCfg.noReplay,
+		"do not replay previous transactions upon reload",
+	)
+
+	fs.Int64Var(
+		&c.maxGas,
+		"max-gas",
+		defaultCfg.maxGas,
+		"set the maximum gas per block",
+	)
+
+	fs.BoolVar(
+		&c.unsafeAPI,
+		"unsafe-api",
+		defaultCfg.unsafeAPI,
+		"enable /reset and /reload endpoints which are not safe to expose publicly",
+	)
+
+	fs.StringVar(
+		&c.logFormat,
+		"log-format",
+		defaultCfg.logFormat,
+		"log output format, can be `json` or `console`",
+	)
+
+	fs.StringVar(
+		&c.paths,
+		"paths",
+		defaultCfg.paths,
+		`additional package paths to preload in the form of "gno.land/r/my/realm", separated by commas`,
+	)
+
+	fs.BoolVar(
+		&c.emptyBlocks,
+		"empty-blocks",
+		defaultCfg.emptyBlocks,
+		"enable creation of empty blocks (default: ~1s interval)",
+	)
+
+	fs.Int64Var(
+		&c.emptyBlocksInterval,
+		"empty-blocks-interval",
+		defaultCfg.emptyBlocksInterval,
+		"set the interval for creating empty blocks (in seconds)",
+	)
+
+	fs.BoolVar(
+		&c.verbose,
+		"v",
+		defaultCfg.verbose,
+		"enable verbose output for development",
+	)
+}
+
+func (c *AppConfig) validateConfigFlags() error {
+	if (c.balancesFile != "" || c.txsFile != "") && c.genesisFile != "" {
+		return ErrConflictingFileArgs
+	}
+
+	return nil
+}

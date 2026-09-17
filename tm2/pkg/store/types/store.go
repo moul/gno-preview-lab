@@ -1,0 +1,226 @@
+package types
+
+import (
+	"bytes"
+	"fmt"
+
+	abci "github.com/gnolang/gno/tm2/pkg/bft/abci/types"
+	dbm "github.com/gnolang/gno/tm2/pkg/db"
+	std "github.com/gnolang/gno/tm2/pkg/std"
+)
+
+type Store interface {
+	// Get returns nil iff key doesn't exist. Panics on nil key.
+	// If gctx is non-nil, gas is charged at the appropriate layer.
+	Get(gctx *GasContext, key []byte) []byte
+
+	// Has checks if a key exists. Panics on nil key.
+	Has(gctx *GasContext, key []byte) bool
+
+	// Set sets the key. Panics on nil key or value.
+	Set(gctx *GasContext, key, value []byte)
+
+	// Delete deletes the key. Panics on nil key.
+	Delete(gctx *GasContext, key []byte)
+
+	// Iterator over a domain of keys in ascending order. End is exclusive.
+	// Start must be less than end, or the Iterator is invalid.
+	// Iterator must be closed by caller.
+	// To iterate over entire domain, use store.Iterator(nil, nil, nil)
+	// CONTRACT: No writes may happen within a domain while an iterator exists over it.
+	// Exceptionally allowed for cachekv.Store, safe to write in the modules.
+	Iterator(gctx *GasContext, start, end []byte) Iterator
+
+	// Iterator over a domain of keys in descending order. End is exclusive.
+	// Start must be less than end, or the Iterator is invalid.
+	// Iterator must be closed by caller.
+	// CONTRACT: No writes may happen within a domain while an iterator exists over it.
+	// Exceptionally allowed for cachekv.Store, safe to write in the modules.
+	ReverseIterator(gctx *GasContext, start, end []byte) Iterator
+
+	// Returns a cache-wrapped store.
+	CacheWrap() Store
+
+	// If cache-wrapped store, writes to underlying store.
+	// Does not write through layers of cache.
+	// No gctx — write cost was already charged at Set() time.
+	Write()
+}
+
+// Alias iterator to db's Iterator for convenience.
+type Iterator = dbm.Iterator
+
+// Queryable allows a Store to expose internal state to the abci.Query
+// interface. Multistore can route requests to the proper Store.
+//
+// This is an optional, but useful extension to any CommitStore
+type Queryable interface {
+	Query(abci.RequestQuery) abci.ResponseQuery
+}
+
+// ImmutableQueryer is the optional capability of serving a store query from a
+// frozen post-commit snapshot, so queries running concurrently with commits
+// (the query ABCI connection has its own mutex) never read live mutable store
+// state. A non-nil error means no snapshot view exists for req.Height (e.g.
+// pre-first-commit, pruned height); callers fall back to Queryable.
+type ImmutableQueryer interface {
+	QueryImmutable(req abci.RequestQuery) (abci.ResponseQuery, error)
+}
+
+// Useful for debugging.
+type Printer interface {
+	Print()
+}
+
+// Write through all caches.
+// You probably don't want this, rather write your program to Write() where
+// appropriate.  Not included in the main Store interface to discourage usage.
+type Flusher interface {
+	Flush()
+}
+
+// Write throgh
+type Writer interface {
+	Write()
+}
+
+// ----------------------------------------
+// MultiStore
+
+type MultiStore interface {
+	// Convenience for fetching substores.
+	// If the store does not exist, panics.
+	GetStore(StoreKey) Store
+
+	// Returns a cache-wrapped multi-store.
+	MultiCacheWrap() MultiStore
+
+	// If cache-wrapped multi-store, flushes to underlying store.
+	MultiWrite()
+}
+
+// ----------------------------------------
+// Checkpointable
+
+// Checkpointable is implemented by cache-wrapped multistores that
+// support snapshotting and rollback. Used by BaseApp to preserve
+// ante handler writes when msg execution fails.
+type Checkpointable interface {
+	// Checkpoint saves a snapshot of the current cache state.
+	Checkpoint()
+	// HasCheckpoint returns true if a checkpoint is active.
+	HasCheckpoint() bool
+	// WriteCheckpoint restores the checkpoint snapshot and flushes
+	// only the checkpointed entries to the parent store.
+	WriteCheckpoint()
+}
+
+// ----------------------------------------
+// Committer, CommitID
+
+// Something that can persist to disk
+type Committer interface {
+	Commit() CommitID
+	LastCommitID() CommitID
+	GetStoreOptions() StoreOptions
+	SetStoreOptions(StoreOptions)
+	LoadLatestVersion() error
+
+	// Load a specific persisted version. When you load an old version, or when
+	// the last commit attempt didn't complete, the next commit after loading
+	// must be idempotent (return the same commit id). Otherwise the behavior is
+	// undefined.
+	LoadVersion(ver int64) error
+}
+
+// Stores of MultiStore must implement CommitStore.
+type CommitStore interface {
+	Committer
+	Store
+}
+
+// InitialVersionSetter is implemented by CommitStores whose committed
+// version can be initialized to a non-zero value. Used by InitChain to
+// align multistore version with chain height when InitialHeight > 1.
+// Stores that don't merkleize (e.g. dbadapter) need not implement this.
+type InitialVersionSetter interface {
+	SetInitialVersion(version int64)
+}
+
+// Used by MultiStores to mount a new store.
+type CommitStoreConstructor func(db dbm.DB, opts StoreOptions) CommitStore
+
+// A non-cache MultiStore.
+type CommitMultiStore interface {
+	Committer
+	MultiStore
+
+	// Mount a store of type using the given db.
+	// If db == nil, the new store will use the CommitMultiStore db.
+	// A non-nil db MUST be the same physical DB as the CommitMultiStore's —
+	// ENFORCED (MountStoreWithDB panics otherwise): query snapshots cover only
+	// that DB, so a separate one would be invisible to snapshot-isolated reads
+	// (see rootmulti constructStore).
+	MountStoreWithDB(key StoreKey, cons CommitStoreConstructor, db dbm.DB)
+
+	// Panics on a nil key.
+	GetCommitStore(key StoreKey) CommitStore
+
+	// MultiImmutableCacheWrapWithVersion returns an immutable MultiStore pinned
+	// to version, backed by a DB snapshot so both IAVL and non-IAVL sub-stores
+	// reflect the same committed block. The caller must call the returned
+	// release func when done to free the snapshot reference.
+	MultiImmutableCacheWrapWithVersion(version int64) (MultiStore, func(), error)
+}
+
+// CommitID contains the tree version number and its merkle root.
+type CommitID struct {
+	Version int64
+	Hash    []byte
+}
+
+func (cid CommitID) Equals(oid CommitID) bool {
+	return cid.Version == oid.Version && bytes.Equal(cid.Hash, oid.Hash)
+}
+
+func (cid CommitID) IsZero() bool {
+	return cid.Version == 0 && len(cid.Hash) == 0
+}
+
+func (cid CommitID) String() string {
+	return fmt.Sprintf("CommitID{%v:%X}", cid.Hash, cid.Version)
+}
+
+// ----------------------------------------
+// Keys for accessing substores
+
+// StoreKey is a key used to index stores in a MultiStore.
+type StoreKey interface {
+	Name() string
+	String() string
+}
+
+type storeKey struct {
+	name string
+}
+
+// NewStoreKey returns a new pointer to a StoreKey.
+// Use a pointer so keys don't collide.
+func NewStoreKey(name string) *storeKey {
+	return &storeKey{
+		name: name,
+	}
+}
+
+func (key *storeKey) Name() string {
+	return key.name
+}
+
+func (key *storeKey) String() string {
+	return fmt.Sprintf("storeKey{%p, %s}", key, key.name)
+}
+
+// ----------------------------------------
+// KVPair
+
+type KVPair = std.KVPair

@@ -1,0 +1,55 @@
+{{ define "renderDir" }} {{ $pkgpath := .PkgPath }}
+<article class="b-directory u-grid-full">
+  <header class="b-content-header">
+    <h1 class="title b-content-h1">{{ $pkgpath }}</h1>
+    <div class="header-info">
+      <span>{{ if .Mode.IsExplorer }} Explorer · {{ .FileCounter }} Packages {{
+        else }} Directory · {{ .FileCounter }} Files {{ end }}</span>
+    </div>
+  </header>
+
+  <ul class="b-list">
+    {{ range .FilesLinks }}
+    <li>
+      <div>
+        <a href="{{ .Link }}">
+          <span class="c-with-icon">
+            <svg class="c-icon">
+              <use href="#ico-file"></use>
+            </svg>
+            <span class="name">{{ .Name }}</span>
+          </span>
+        </a>
+        {{ if $.Mode.IsExplorer }}
+        <span class="c-inline">
+          {{ if not (hasPrefix $pkgpath "/p/") }}
+          <a href="{{ .Link }}" class="b-inline-btn">Open</a>
+          {{ end }}
+          <a href="{{ .Link }}/" class="b-inline-btn">Browse</a>
+          <a href="{{ .Link }}$source" class="b-inline-btn">Source</a>
+          {{ if not (hasPrefix $pkgpath "/p/") }}
+          <a href="{{ .Link }}$help" class="b-inline-btn">Action</a>
+          {{ end }}
+        </span>
+        {{ end }}
+      </div>
+    </li>
+    {{ end }}
+  </ul>
+
+  {{ if .Readme }}
+  <div class="b-content-header">
+    <span class="c-with-icon">
+      <svg class="c-icon">
+        <use href="#ico-readme"></use>
+      </svg>
+      <span>README.md</span>
+    </span>
+    <a href="{{ $pkgpath }}$source&file=README.md" class="b-inline-btn">Open</a>
+  </div>
+  <md-renderer class="c-readme-view">
+    {{ render .Readme }}
+  </md-renderer>
+  {{ end }}
+</article>
+{{ end }}

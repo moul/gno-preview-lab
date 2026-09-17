@@ -1,0 +1,251 @@
+# Understanding Gno Packages
+
+In Gno.land, code is organized into packages that are stored on-chain. This
+guide explains the different types of packages, how they're organized, and how
+to work with them.
+
+## Package Types
+
+Gno has three fundamental package types:
+
+### Pure Packages (`/p/`)
+
+Pure packages are stateless Gno libraries meant to be reused by other Gno
+code. Here are the defining features of pure packages:
+- Don't maintain state between calls
+- Can be imported by both realms and other pure packages
+- Are stored under paths beginning with `/p/`
+- Can be written & deployed to the chain by anyone, permissionlessly
+- Users cannot call functions in pure packages directly
+- Documentation should be contained within package code as comments, following the [Go doc standard](https://tip.golang.org/doc/comment)
+
+Example: `gno.land/p/nt/avl/v0` (An AVL tree implementation)
+
+### Realms (`/r/`)
+
+[Realms](./realms.md) are stateful applications (smart contracts) that can:
+- Maintain persistent state between transactions
+- Expose functions for interaction
+- Render web content
+- Import pure packages and use their functionality
+- Are stored under paths beginning with `/r/`
+
+Example: `gno.land/r/demo/boards` (A discussion forum application)
+
+For more details on realms, see the dedicated [Realms](./realms.md) documentation.
+
+### Ephemeral Packages (`/e/`)
+
+Ephemeral packages are temporary, user-executed code that:
+- Are created dynamically when users run `gnokey maketx run`
+- Have the pattern `domain/e/{user-address}/run`
+- Execute in the user's realm context
+- Can call both crossing and non-crossing functions
+- Are not stored on-chain
+- Allow complex interactions that aren't possible with simple `maketx call`
+
+Example: `gno.land/e/g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5/run` (A user's run script)
+
+For more details on ephemeral packages and the `maketx run` command, see [Interacting with gnokey](../users/interact-with-gnokey.md#run).
+
+### Import rules
+
+Not every package type can import every other. The rules:
+
+- **Pure packages (`/p/`)** can be imported by anything: realms, other pure packages, and ephemeral packages.
+- **Realms (`/r/`)** can be imported by other realms and by ephemeral packages, but **not by pure packages** (importing state into a stateless library is forbidden).
+- **Ephemeral packages (`/e/`)** **cannot be imported by anything**. They exist only during their own execution.
+
+Importing a realm gives access to its exported functions and interacts with that realm's persistent state. Importing a pure package gives access to its exported functions only, with no state persistence.
+
+## Package Path Structure
+
+A package path is a unique identifier for any package that lives on the Gno.land
+blockchain. It consists of multiple parts separated with `/` and follows this
+structure:
+
+```
+gno.land/[r|p|e]/[namespace]/[package-name]
+          │      │          │
+          │      │          └── Name of the package
+          │      └── Namespace (address or reserved name)
+          └── Type (realm, pure package, or ephemeral)
+```
+
+For example:
+- `gno.land/r/gnoland/home` is the gno.land home realm
+- `gno.land/r/leon/hor` is the Hall of Realms
+- `gno.land/p/nt/avl/v0` is the AVL tree package
+- `gno.land/e/g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5/run` is a user's ephemeral run script
+
+The components of these paths are:
+- `gno.land` is the chain domain. Currently, only `gno.land` is supported, but the ecosystem may expand in the future.
+- `p`, `r`, or `e` declare the type of package found at the path. `p` stands for pure package, `r` represents [realm](./realms.md), and `e` represents ephemeral package.
+- `demo`, `gnoland`, etc., represent namespaces as described below.
+- `home`, `hof`, `avl`, `run`, etc., represent the package name found at the path.
+
+Important facts about package paths:
+- The maximum length of a package path is `256` characters.
+- A realm's address is directly derived from its package path, by using [`chain.PackageAddress()`](./gno-stdlibs.md#packageaddress)
+- **The package name in your source code must match the last element of the path.** For example, `gno.land/r/demo/counter` requires `package counter`.
+- Because package names are identifiers of the form `[a-z][a-z0-9_]+`, the
+  last element of a deployable path must also have that form: lowercase
+  letters, digits and underscores, starting with a letter, and at least two
+  characters long. In particular, hyphens are allowed in intermediate path
+  elements (e.g. namespaces like `gno.land/r/my-team/counter`) but not in the
+  last element, since no package name could match it.
+
+### Version Suffixes
+
+Package paths can include version suffixes for versioned packages:
+
+- `gno.land/r/demo/mylib/v1` → package name should be `mylib`
+- `gno.land/r/demo/mylib/v2` → package name should be `mylib`
+- `gno.land/p/demo/utils/v10` → package name should be `utils`
+
+A path may end in at most one version suffix: paths ending in consecutive
+version suffixes (e.g. `gno.land/r/demo/mylib/v2/v3`) are rejected.
+
+## Namespaces
+
+Namespaces provide users with the exclusive ability to publish code under their
+designated identifiers, similar to GitHub's user and organization model. For
+detailed information on how to register and use namespaces,
+see [Users and Teams](./users-and-teams.md).
+
+Initially, all users are granted a default namespace with their address - a
+pseudo-anonymous (PA) namespace - to which the associated address can
+deploy. This namespace has the following format:
+```
+gno.land/{p,r}/{address}/**
+```
+
+For example, for address `g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5`, all the
+following paths are valid for deployments:
+
+- `gno.land/p/g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5/mypackage`
+- `gno.land/r/g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5/myrealm`
+- `gno.land/p/g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5/mypackage/subpackage/package`
+- `gno.land/r/g1jg8mtutu9khhfwc4nxmuhcpftf0pajdhfvsqf5/subpackage/realm`
+
+Apart from package names, developers can define subpackages to further organize
+their code, as seen in the example above. Packages can have any varying level of
+depth as long as the full package path doesn't exceed `256` characters.
+
+### Custom Namespaces
+
+Custom namespaces are **not currently supported** but are planned to be introduced via GovDAO
+governance in the future.
+
+## Importing Packages
+
+Gno packages can import other packages using standard Go import syntax:
+
+```go
+import (
+    "gno.land/p/nt/avl/v0"          // Pure package import
+    "gno.land/r/demo/users"      // Realm import (access exported functions)
+)
+```
+
+## Commonly Used Pure Packages
+
+To better understand how packages work, let's look at a few commonly used ones
+from the [`examples`](https://github.com/gnolang/gno/tree/master/examples/)
+folder. 
+
+### Package `avl`
+
+Deployed under `gno.land/p/nt/avl/v0`, the AVL package provides a gas-efficient sorted tree
+structure for storing key-value data. It is one option in the broader family of
+tree-backed indexes, useful when you need access to large datasets.
+
+See [Effective Gno](./effective-gno.md#choose-storage-types-by-access-pattern) for storage-type guidance
+and the [package README](../../examples/gno.land/p/nt/avl/v0/README.md) for technical details.
+
+#### Usage example:
+
+```go
+package myrealm
+
+import (
+	"gno.land/p/nt/avl/v0"
+)
+
+// This AVL tree will be persisted after transaction calls
+var tree *avl.Tree
+
+func Set(key string, value int) {
+	// tree.Set takes in a string key, and a value that can be of any type
+	tree.Set(key, value)
+}
+
+func Get(key string) int {
+  // tree.Get returns the value at given key, or nil if the key does not exist.
+  // Use a type assertion to convert the raw value into the proper type.
+  rawValue := tree.Get(key)
+  if rawValue == nil {
+	  panic("value at given key does not exist")
+  }
+
+  return rawValue.(int)
+}
+
+func Exists(key string) bool {
+  // tree.Has returns true if the key exists
+  return tree.Has(key)
+}
+```
+
+View the package source on [GitHub](../../examples/gno.land/p/nt/avl/v0).
+
+### Package `ufmt`
+
+Deployed under `gno.land/p/nt/ufmt/v0`, this package is a minimal version of the
+`fmt` package:
+
+```go
+// Package ufmt provides utility functions for formatting strings, similarly
+// to the Go package "fmt", of which only a subset is currently supported
+// (hence the name µfmt - micro fmt).
+package ufmt
+```
+
+View the package source on [GitHub](../../examples/gno.land/p/nt/ufmt/v0).
+
+### Package `seqid`
+
+Deployed under `gno.land/p/nt/seqid/v0`, this package provides a simple way to
+have sequential IDs in Gno:
+
+```go
+// Package seqid provides a simple way to have sequential IDs which will be
+// ordered correctly when inserted in an AVL tree.
+//
+// Sample usage:
+//
+//	var id seqid.ID
+//	var users avl.Tree
+//
+//	func NewUser() {
+//		users.Set(id.Next().String(), &User{ ... })
+//	}
+package seqid
+```
+
+View the package source on [GitHub](../../examples/gno.land/p/nt/seqid/v0).
+
+## Exploring Deployed Packages
+
+You can explore all deployed packages using gnoweb. For example, you can visit the
+[`gnoland`](https://gno.land/r/gnoland/) namespace to see all packages that have 
+been deployed there.
+
+This provides transparency and allows you to learn from existing code.
+
+## Building Your Own Packages
+
+For detailed instructions on creating your own packages:
+
+- For a hands-on walkthrough, see [Getting started](../builders/getting-started.md)
+- For a full example, see [Tutorial: MiniSocial dApp](../builders/tutorial-minisocial.md)

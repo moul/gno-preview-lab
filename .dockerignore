@@ -1,0 +1,51 @@
+.dockerignore
+Dockerfile
+docker-compose.yml
+build/
+misc/*
+!misc/loop/
+!misc/autocounterd/
+!misc/val-scenarios/
+tests/docker-integration/
+docs/
+.github/
+*.md
+
+# Excluded to make Docker build cache stable across CI checkouts.
+.git
+.gitignore
+.gitattributes
+
+# Copied from .gitignore
+
+# Editor Leftovers
+.DS_Store
+.vscode
+.idea
+
+# Default node data
+gnoland-data
+genesis.json
+
+# Build leftovers
+build
+
+# Legacy .gitignore
+data/*
+testdir
+
+# Log + generation leftovers
+*.tx
+*.log.*
+*.log
+*.gno.gen.go
+*.gno.gen_test.go
+*.pb.go
+pbbindings.go
+*~
+.#*
+*#
+
+# Test coverage leftovers
+cover.out
+coverage.out

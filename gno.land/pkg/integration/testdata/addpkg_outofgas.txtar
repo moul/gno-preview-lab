@@ -1,0 +1,59 @@
+# ensure users get proper out of gas errors when they add packages
+
+# start a new node
+gnoland start
+
+# add foo package
+gnokey maketx addpkg -pkgdir $WORK/foo -pkgpath gno.land/r/foo -gas-fee 350001ugnot -gas-wanted 3_500_000 -chainid=tendermint_test test1
+
+
+# add bar package - runs out of gas early in store access with gas 60000
+# (the exact failure point shifts with the depth gas params; the assertion
+# only requires an out-of-gas error)
+
+! gnokey maketx addpkg -pkgdir $WORK/bar -pkgpath gno.land/r/bar -gas-fee 1000000ugnot -gas-wanted 60000 -chainid=tendermint_test test1
+
+stderr '--= Error =--'
+stderr 'Data: out of gas error'
+stderr '--= /Error =--'
+
+
+
+# runs out of gas slightly later with gas 63000 (same caveat as above)
+
+! gnokey maketx addpkg -pkgdir $WORK/bar -pkgpath gno.land/r/bar -gas-fee 1000000ugnot -gas-wanted 63000 -chainid=tendermint_test test1
+
+stderr '--= Error =--'
+stderr 'Data: out of gas error'
+stderr '--= /Error =--'
+
+-- foo/gnomod.toml --
+module = "gno.land/r/foo"
+gno = "0.9"
+
+-- foo/foo.gno --
+package foo
+
+type Counter int
+
+func Inc(i Counter) Counter{
+    i = i+1
+   return i
+}
+
+-- bar/gnomod.toml --
+module = "gno.land/r/bar"
+gno = "0.9"
+
+-- bar/bar.gno --
+package bar
+
+import "gno.land/r/foo"
+
+type NewCounter foo.Counter
+
+func Add2(i NewCounter) NewCounter{
+    i=i+2
+
+   return i
+}

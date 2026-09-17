@@ -1,0 +1,381 @@
+package gnolang
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"github.com/gnolang/gno/tm2/pkg/db/memdb"
+	"github.com/gnolang/gno/tm2/pkg/std"
+	"github.com/gnolang/gno/tm2/pkg/store/dbadapter"
+	"github.com/gnolang/gno/tm2/pkg/store/iavl"
+	stypes "github.com/gnolang/gno/tm2/pkg/store/types"
+	"github.com/stretchr/testify/assert"
+)
+
+type uverseTestCases struct {
+	name     string
+	code     string
+	expected string
+}
+
+func TestIssue1337PrintNilSliceAsUndefined(t *testing.T) {
+	test := []uverseTestCases{
+		{
+			name: "print empty slice",
+			code: `package test
+			func main() {
+				emptySlice1 := make([]int, 0)
+				emptySlice2 := []int{}
+
+				println(emptySlice1)
+				println(emptySlice2)
+			}`,
+			expected: "slice[]\nslice[]\n",
+		},
+		{
+			name: "nil slice",
+			code: `package test
+			func main() {
+				println(nil)
+			}`,
+			expected: "undefined\n",
+		},
+		{
+			name: "print empty string slice",
+			code: `package test
+			func main() {
+				var a []string
+				println(a)
+			}`,
+			expected: "(nil []string)\n",
+		},
+		{
+			name: "print non-empty slice",
+			code: `package test
+			func main() {
+				a := []string{"a", "b"}
+				println(a)
+			}`,
+			expected: "slice[(\"a\" string),(\"b\" string)]\n",
+		},
+		{
+			name: "print empty map",
+			code: `package test
+			func main() {
+				var a map[string]string
+				println(a)
+			}`,
+			expected: "(nil map[string]string)\n",
+		},
+		{
+			name: "print non-empty map",
+			code: `package test
+			func main() {
+				a := map[string]string{"a": "b"}
+				println(a)
+			}`,
+			expected: "map{(\"a\" string):(\"b\" string)}\n",
+		},
+		{
+			name: "print nil struct",
+			code: `package test
+			func main() {
+				var a struct{}
+				println(a)
+			}`,
+			expected: "struct{}\n",
+		},
+		{
+			name: "print function",
+			code: `package test
+			func foo(a, b int) int {
+				return a + b
+			}
+			func main() {
+				println(foo(1, 3))
+			}`,
+			expected: "4\n",
+		},
+		{
+			name: "print composite slice",
+			code: `package test
+			func main() {
+				const a, b, c, d = 1, 2, 3, 4
+				x := []int{
+					a: b,
+					c: d,
+				}
+				println(x)
+			}`,
+			expected: "slice[(0 int),(2 int),(0 int),(4 int)]\n",
+		},
+		{
+			name: "simple recover case",
+			code: `package test
+
+			func main() {
+				defer func() { println("recover", recover()) }()
+				println("simple panic")
+			}`,
+			expected: "simple panic\nrecover undefined\n",
+		},
+		{
+			name: "nested recover",
+			code: `package test
+
+			func main() {
+				defer func() { println("outer recover", recover()) }()
+				defer func() { println("nested panic") }()
+				println("simple panic")
+			}`,
+			expected: "simple panic\nnested panic\nouter recover undefined\n",
+		},
+		{
+			name: "print non-nil function",
+			code: `package test
+			func f() int {
+				return 1
+			}
+
+			func main() {
+				g := f
+				println(g)
+			}`,
+			expected: "f\n",
+		},
+		{
+			name: "print primitive types",
+			code: `package test
+			func main() {
+				println(1)
+				println(1.1)
+				println(true)
+				println("hello")
+			}`,
+			expected: "1\n1.1\ntrue\nhello\n",
+		},
+	}
+
+	for _, tc := range test {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewMachine("test", nil)
+			n := m.MustParseFile("main.go", tc.code)
+			m.RunFiles(n)
+			m.RunMain()
+			assertOutput(t, tc.code, tc.expected)
+		})
+	}
+}
+
+var pSink any = nil
+
+func BenchmarkGnoPrintln(b *testing.B) {
+	var buf bytes.Buffer
+	db := memdb.NewMemDB()
+	baseStore := dbadapter.StoreConstructor(db, stypes.StoreOptions{})
+	iavlStore := iavl.StoreConstructor(db, stypes.StoreOptions{})
+	store := NewStore(nil, baseStore, iavlStore)
+
+	m := NewMachineWithOptions(MachineOptions{
+		Output: &buf,
+		Store:  store,
+	})
+
+	program := `package p
+				func main() {
+					for i := 0; i < 1000; i++ {
+						println("abcdeffffffffffffffff1222 11111   11111")
+					}
+				}`
+	m.RunMemPackage(&std.MemPackage{
+		Type: MPUserProd,
+		Name: "p",
+		Path: "exmaple.com/r/p",
+		Files: []*std.MemFile{
+			{Name: "a.gno", Body: program},
+		},
+	}, false)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		m.RunMain()
+		pSink = buf.String()
+	}
+
+	if pSink == nil {
+		b.Fatal("Benchmark did not run!")
+	}
+	pSink = nil
+}
+
+func TestGnoPrintAndPrintln(t *testing.T) {
+	tests := []struct {
+		name    string
+		srcArgs string
+		want    string
+	}{
+		{
+			"print with no args",
+			"print()",
+			"",
+		},
+		{
+			"print with 1 arg",
+			`print("1")`,
+			"1",
+		},
+		{
+			"print with 2 args",
+			`print("1", 2)`,
+			"1 2",
+		},
+		{
+			"print with 3 args",
+			`print("1", 2, "*")`,
+			"1 2 *",
+		},
+		{
+			"print with own spaces",
+			`print("1 ", 2, "*")`,
+			"1  2 *",
+		},
+		{
+			"println with no args",
+			"println()",
+			"\n",
+		},
+		{
+			"print with 1 arg",
+			`println("1")`,
+			"1\n",
+		},
+		{
+			"println with 2 args",
+			`println("1", 2)`,
+			"1 2\n",
+		},
+		{
+			"println with 3 args",
+			`println("1", 2, "*")`,
+			"1 2 *\n",
+		},
+		{
+			"println with own spaces",
+			`println("1 ", 2, "*")`,
+			"1  2 *\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			db := memdb.NewMemDB()
+			baseStore := dbadapter.StoreConstructor(db, stypes.StoreOptions{})
+			iavlStore := iavl.StoreConstructor(db, stypes.StoreOptions{})
+			store := NewStore(nil, baseStore, iavlStore)
+
+			m := NewMachineWithOptions(MachineOptions{
+				Output: &buf,
+				Store:  store,
+			})
+
+			program := `package p
+				func main() {` + tt.srcArgs + "\n}"
+			m.RunMemPackage(&std.MemPackage{
+				Type: MPUserProd,
+				Name: "p",
+				Path: "exmaple.com/r/p",
+				Files: []*std.MemFile{
+					{Name: "a.gno", Body: program},
+				},
+			}, false)
+
+			buf.Reset()
+			m.RunMain()
+			got := buf.String()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// Legacy AST-persisted origin placeholders carry the 3-field .grealm
+// shape (predating the sub-realm fields); the sub-token accessors must
+// treat the missing fields as zero, and the origin persistence
+// exemption must keep covering them while never covering sub-tokens.
+func TestRealmLegacyThreeFieldShape(t *testing.T) {
+	sv := &StructValue{Fields: []TypedValue{
+		{T: gAddressType, V: StringValue("")},
+		{T: StringType, V: StringValue("")},
+		{}, // prev truly-nil: origin shape
+	}}
+	if got := realmSubpathOf(sv); got != "" {
+		t.Fatalf("realmSubpathOf(legacy) = %q, want empty", got)
+	}
+	if got := realmParentOf(sv); got != nil {
+		t.Fatalf("realmParentOf(legacy) = %v, want nil", got)
+	}
+	hiv := &HeapItemValue{Value: TypedValue{T: gConcreteRealmType, V: sv}}
+	if !isOriginRealmHIV(hiv) {
+		t.Fatal("legacy 3-field origin must remain persistence-exempt")
+	}
+
+	// A sub-token with a truly-nil prev must NOT be origin-exempt:
+	// exempting it would make the sub-token persistable.
+	sub := newSubRealmHIVPointer(nil, "addr", "example.com/r/host#x", TypedValue{}, "x", TypedValue{})
+	if isOriginRealmHIV(realmHIV(&sub)) {
+		t.Fatal("nil-prev sub-token must not be persistence-exempt")
+	}
+}
+
+// isValidSubpath enforces the frozen sub-realm subpath grammar:
+// segment ("/" segment)*, segment = [a-z0-9] ([a-z0-9_.-]* [a-z0-9])?.
+// Freeze-critical: loosening later is additive, tightening later would
+// strand funds — so the accepted/rejected sets are pinned here.
+func TestIsValidSubpath(t *testing.T) {
+	t.Parallel()
+	valid := []string{
+		"a", "dao", "dao42", "dao/42", "v1.2", "role_admin",
+		"a/b/c", "g1abc", "a-b", "x.y-z_w", "0", "1/2/3",
+	}
+	invalid := []string{
+		"", "/", "//", "dao/", "/dao", "a//b", "Dao", "DAO",
+		"a b", "a\tb", "a\nb", "a:b", "a#b", "a\x00b", "..", ".", "../x",
+		"_x", "x_", "-x", "x-", ".x", "x.",
+		"caf\u00e9", // non-ASCII (é)
+		"a\u202eb",  // RTL override
+		"a/",
+		"a/./b",
+	}
+	for _, s := range valid {
+		if !isValidSubpath(s) {
+			t.Errorf("isValidSubpath(%q) = false, want true", s)
+		}
+	}
+	for _, s := range invalid {
+		if isValidSubpath(s) {
+			t.Errorf("isValidSubpath(%q) = true, want false", s)
+		}
+	}
+}
+
+// subRealmPathError enforces the total-length cap over the synthesized
+// "host#subpath" (not the subpath alone), keeping downstream
+// pkgpath-sized buffers valid.
+func TestSubRealmPathErrorTotalCap(t *testing.T) {
+	t.Parallel()
+	host := "gno.land/r/x"
+	// host + "#" + subpath == 256 is OK; 257 is rejected.
+	okSub := strings.Repeat("a", 256-len(host)-1)
+	synth := host + subRealmSep + okSub
+	if e := subRealmPathError(host, okSub, synth); e != "" {
+		t.Errorf("256-byte synthesized rejected: %s", e)
+	}
+	tooLong := okSub + "a"
+	if e := subRealmPathError(host, tooLong, host+subRealmSep+tooLong); e == "" {
+		t.Error("257-byte synthesized accepted, want rejected")
+	}
+}

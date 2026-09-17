@@ -1,0 +1,12 @@
+{{ define "status" }}
+<div class="c-full-screen u-text-center">
+  {{ template "ui/gnome" }}
+  <h1 class="b-content-h1 u-capitalize">
+    {{ .Title }}
+  </h1>
+  <p>{{ .Body }}</p>
+  <a href="{{ .ButtonURL }}" class="b-btn u-mt-4">
+    {{ .ButtonText }}
+  </a>
+</div>
+{{ end }}

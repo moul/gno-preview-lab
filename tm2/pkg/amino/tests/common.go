@@ -1,0 +1,739 @@
+package tests
+
+import (
+	"fmt"
+	"math"
+	"strconv"
+	"time"
+
+	"github.com/gnolang/gno/tm2/pkg/amino/tests/crosspkg"
+)
+
+// ----------------------------------------
+// Struct types
+
+type EmptyStruct struct{}
+
+type PrimitivesStruct struct {
+	Int8        int8
+	Int16       int16
+	Int32       int32
+	Int32Fixed  int32 `binary:"fixed32"`
+	Int64       int64
+	Int64Fixed  int64 `binary:"fixed64"`
+	Int         int
+	Byte        byte
+	Uint8       uint8
+	Uint16      uint16
+	Uint32      uint32
+	Uint32Fixed uint32 `binary:"fixed32"`
+	Uint64      uint64
+	Uint64Fixed uint64 `binary:"fixed64"`
+	Uint        uint
+	Str         string
+	Bytes       []byte
+	Time        time.Time
+	Duration    time.Duration
+	Empty       EmptyStruct
+}
+
+type ShortArraysStruct struct {
+	TimeAr     [0]time.Time
+	DurationAr [0]time.Duration
+}
+
+type ArraysStruct struct {
+	Int8Ar        [4]int8
+	Int16Ar       [4]int16
+	Int32Ar       [4]int32
+	Int32FixedAr  [4]int32 `binary:"fixed32"`
+	Int64Ar       [4]int64
+	Int64FixedAr  [4]int64 `binary:"fixed64"`
+	IntAr         [4]int
+	ByteAr        [4]byte
+	Uint8Ar       [4]uint8
+	Uint16Ar      [4]uint16
+	Uint32Ar      [4]uint32
+	Uint32FixedAr [4]uint32 `binary:"fixed32"`
+	Uint64Ar      [4]uint64
+	Uint64FixedAr [4]uint64 `binary:"fixed64"`
+	UintAr        [4]uint
+	StrAr         [4]string
+	BytesAr       [4][]byte
+	TimeAr        [4]time.Time
+	DurationAr    [4]time.Duration
+	EmptyAr       [4]EmptyStruct
+}
+
+type ArraysArraysStruct struct {
+	Int8ArAr        [2][2]int8
+	Int16ArAr       [2][2]int16
+	Int32ArAr       [2][2]int32
+	Int32FixedArAr  [2][2]int32 `binary:"fixed32"`
+	Int64ArAr       [2][2]int64
+	Int64FixedArAr  [2][2]int64 `binary:"fixed64"`
+	IntArAr         [2][2]int
+	ByteArAr        [2][2]byte
+	Uint8ArAr       [2][2]uint8
+	Uint16ArAr      [2][2]uint16
+	Uint32ArAr      [2][2]uint32
+	Uint32FixedArAr [2][2]uint32 `binary:"fixed32"`
+	Uint64ArAr      [2][2]uint64
+	Uint64FixedArAr [2][2]uint64 `binary:"fixed64"`
+	UintArAr        [2][2]uint
+	StrArAr         [2][2]string
+	BytesArAr       [2][2][]byte
+	TimeArAr        [2][2]time.Time
+	DurationArAr    [2][2]time.Duration
+	EmptyArAr       [2][2]EmptyStruct
+}
+
+type SlicesStruct struct {
+	Int8Sl        []int8
+	Int16Sl       []int16
+	Int32Sl       []int32
+	Int32FixedSl  []int32 `binary:"fixed32"`
+	Int64Sl       []int64
+	Int64FixedSl  []int64 `binary:"fixed64"`
+	IntSl         []int
+	ByteSl        []byte
+	Uint8Sl       []uint8
+	Uint16Sl      []uint16
+	Uint32Sl      []uint32
+	Uint32FixedSl []uint32 `binary:"fixed32"`
+	Uint64Sl      []uint64
+	Uint64FixedSl []uint64 `binary:"fixed64"`
+	UintSl        []uint
+	StrSl         []string
+	BytesSl       [][]byte
+	TimeSl        []time.Time
+	DurationSl    []time.Duration
+	EmptySl       []EmptyStruct
+}
+
+type SlicesSlicesStruct struct {
+	Int8SlSl        [][]int8
+	Int16SlSl       [][]int16
+	Int32SlSl       [][]int32
+	Int32FixedSlSl  [][]int32 `binary:"fixed32"`
+	Int64SlSl       [][]int64
+	Int64FixedSlSl  [][]int64 `binary:"fixed64"`
+	IntSlSl         [][]int
+	ByteSlSl        [][]byte
+	Uint8SlSl       [][]uint8
+	Uint16SlSl      [][]uint16
+	Uint32SlSl      [][]uint32
+	Uint32FixedSlSl [][]uint32 `binary:"fixed32"`
+	Uint64SlSl      [][]uint64
+	Uint64FixedSlSl [][]uint64 `binary:"fixed64"`
+	UintSlSl        [][]uint
+	StrSlSl         [][]string
+	BytesSlSl       [][][]byte
+	TimeSlSl        [][]time.Time
+	DurationSlSl    [][]time.Duration
+	EmptySlSl       [][]EmptyStruct
+}
+
+type PointersStruct struct {
+	Int8Pt        *int8
+	Int16Pt       *int16
+	Int32Pt       *int32
+	Int32FixedPt  *int32 `binary:"fixed32"`
+	Int64Pt       *int64
+	Int64FixedPt  *int64 `binary:"fixed64"`
+	IntPt         *int
+	BytePt        *byte
+	Uint8Pt       *uint8
+	Uint16Pt      *uint16
+	Uint32Pt      *uint32
+	Uint32FixedPt *uint32 `binary:"fixed32"`
+	Uint64Pt      *uint64
+	Uint64FixedPt *uint64 `binary:"fixed64"`
+	UintPt        *uint
+	StrPt         *string
+	BytesPt       *[]byte
+	TimePt        *time.Time
+	DurationPt    *time.Duration
+	EmptyPt       *EmptyStruct
+}
+
+type PointerSlicesStruct struct {
+	Int8PtSl        []*int8
+	Int16PtSl       []*int16
+	Int32PtSl       []*int32
+	Int32FixedPtSl  []*int32 `binary:"fixed32"`
+	Int64PtSl       []*int64
+	Int64FixedPtSl  []*int64 `binary:"fixed64"`
+	IntPtSl         []*int
+	BytePtSl        []*byte
+	Uint8PtSl       []*uint8
+	Uint16PtSl      []*uint16
+	Uint32PtSl      []*uint32
+	Uint32FixedPtSl []*uint32 `binary:"fixed32"`
+	Uint64PtSl      []*uint64
+	Uint64FixedPtSl []*uint64 `binary:"fixed64"`
+	UintPtSl        []*uint
+	StrPtSl         []*string
+	BytesPtSl       []*[]byte
+	TimePtSl        []*time.Time
+	DurationPtSl    []*time.Duration
+	EmptyPtSl       []*EmptyStruct
+}
+
+/* amino 1.2 removed nested pointer support.
+// NOTE: See registered fuzz funcs for *byte, **byte, and ***byte.
+type NestedPointersStruct struct {
+	Ptr1 *byte
+	Ptr2 **byte
+	Ptr3 ***byte
+}
+*/
+
+// ----------------------------------------
+// AminoMarshalerStruct1
+// struct -> repr struct
+
+type AminoMarshalerStruct1 struct {
+	A int32
+	B int32
+}
+
+type ReprStruct1 struct {
+	C int64
+	D int64
+}
+
+func (ams AminoMarshalerStruct1) MarshalAmino() (ReprStruct1, error) {
+	return ReprStruct1{
+		C: int64(ams.A),
+		D: int64(ams.B),
+	}, nil
+}
+
+func (ams *AminoMarshalerStruct1) UnmarshalAmino(rs ReprStruct1) error {
+	ams.A = int32(rs.C)
+	ams.B = int32(rs.D)
+	return nil
+}
+
+// ----------------------------------------
+// AminoMarshalerStruct2
+// struct -> []struct
+
+type AminoMarshalerStruct2 struct {
+	a string // unexposed (dontcare)
+	B int32  // exposed (dontcare)
+}
+
+type ReprElem2 struct {
+	Key   string
+	Value any
+}
+
+func (re ReprElem2) get(key string) (value any) {
+	if re.Key != key {
+		panic(fmt.Sprintf("wanted %v but is %v", key, re.Key))
+	}
+	return re.Value
+}
+
+func (ams AminoMarshalerStruct2) MarshalAmino() ([]ReprElem2, error) {
+	return []ReprElem2{
+		{"a", ams.a},
+		{"B", ams.B},
+	}, nil
+}
+
+func (ams *AminoMarshalerStruct2) UnmarshalAmino(repr []ReprElem2) error {
+	ams.a = repr[0].get("a").(string)
+	ams.B = repr[1].get("B").(int32)
+	return nil
+}
+
+// ----------------------------------------
+// AminoMarshalerStruct3
+// struct -> int
+
+type AminoMarshalerStruct3 struct {
+	A int32
+}
+
+func (ams AminoMarshalerStruct3) MarshalAmino() (int32, error) {
+	return ams.A, nil
+}
+
+func (ams *AminoMarshalerStruct3) UnmarshalAmino(i int32) error {
+	ams.A = i
+	return nil
+}
+
+// ----------------------------------------
+// AminoMarshalerInt4
+// int -> struct
+
+type AminoMarshalerInt4 int32
+
+type ReprStruct4 struct {
+	A int32
+}
+
+func (am AminoMarshalerInt4) MarshalAmino() (ReprStruct4, error) {
+	return ReprStruct4{A: int32(am)}, nil
+}
+
+func (am *AminoMarshalerInt4) UnmarshalAmino(rs ReprStruct4) error {
+	*am = AminoMarshalerInt4(rs.A)
+	return nil
+}
+
+// ----------------------------------------
+// AminoMarshalerInt5
+// int -> string
+
+type AminoMarshalerInt5 int32
+
+func (am AminoMarshalerInt5) MarshalAmino() (string, error) {
+	return fmt.Sprintf("%v", am), nil
+}
+
+func (am *AminoMarshalerInt5) UnmarshalAmino(repr string) error {
+	i, err := strconv.Atoi(repr)
+	if err != nil {
+		return err
+	}
+	if i < math.MinInt32 || i > math.MaxInt32 {
+		return fmt.Errorf("value %d overflows int32", i)
+	}
+	*am = AminoMarshalerInt5(i)
+	return nil
+}
+
+// ----------------------------------------
+// AminoMarshalerStruct6
+// struct -> []struct, where elems are struct -> struct
+
+type AminoMarshalerStruct6 struct {
+	A int32
+	B int32
+}
+
+func (ams AminoMarshalerStruct6) MarshalAmino() ([]AminoMarshalerStruct1, error) {
+	return []AminoMarshalerStruct1{{A: ams.A, B: ams.B}}, nil
+}
+
+func (ams *AminoMarshalerStruct6) UnmarshalAmino(repr []AminoMarshalerStruct1) error {
+	ams.A = repr[0].A
+	ams.B = repr[0].B
+	return nil
+}
+
+// ----------------------------------------
+// AminoMarshalerStruct7
+// struct -> []struct, where elems are struct -> byte
+// NOTE: this should optimize to p3 bytes.
+
+type AminoMarshalerStruct7 struct {
+	A int8
+}
+
+func (ams AminoMarshalerStruct7) MarshalAmino() ([]ReprElem7, error) {
+	return []ReprElem7{{A: ams.A}}, nil
+}
+
+func (ams *AminoMarshalerStruct7) UnmarshalAmino(repr []ReprElem7) error {
+	ams.A = repr[0].A
+	return nil
+}
+
+type ReprElem7 struct {
+	A int8
+}
+
+func (re ReprElem7) MarshalAmino() (uint8, error) {
+	return uint8(re.A), nil
+}
+
+func (re *ReprElem7) UnmarshalAmino(u uint8) error {
+	re.A = int8(u)
+	return nil
+}
+
+// ----------------------------------------
+// SimpleAddress: [20]byte with string repr (mimics crypto.Address).
+// Exercises AminoMarshaler elements inside slices/arrays/pointer-slices.
+
+type SimpleAddress [20]byte
+
+func (a SimpleAddress) MarshalAmino() (string, error) {
+	return fmt.Sprintf("%x", a[:]), nil
+}
+
+func (a *SimpleAddress) UnmarshalAmino(repr string) error {
+	if len(repr) != 40 {
+		return fmt.Errorf("invalid SimpleAddress length: %d", len(repr))
+	}
+	for i := range 20 {
+		var b byte
+		if _, err := fmt.Sscanf(repr[i*2:i*2+2], "%02x", &b); err != nil {
+			return err
+		}
+		a[i] = b
+	}
+	return nil
+}
+
+// HostRepr: AminoMarshaler with []byte repr. Exercises primitiveValueSizeExpr
+// ByteSlice path in the list-element size calculation.
+
+type HostRepr struct {
+	IP string
+}
+
+func (hr HostRepr) MarshalAmino() ([]byte, error) {
+	return []byte(hr.IP), nil
+}
+
+func (hr *HostRepr) UnmarshalAmino(repr []byte) error {
+	hr.IP = string(repr)
+	return nil
+}
+
+// CounterRepr: AminoMarshaler with uint8 repr. Exercises the packed list
+// branch for AminoMarshaler elements. Non-lossy: underlying type is also uint8.
+
+type CounterRepr uint8
+
+func (c CounterRepr) MarshalAmino() (uint8, error) {
+	return uint8(c), nil
+}
+
+func (c *CounterRepr) UnmarshalAmino(repr uint8) error {
+	*c = CounterRepr(repr)
+	return nil
+}
+
+// ContainerWithAminoLists: various list shapes of AminoMarshaler elements.
+
+type ContainerWithAminoLists struct {
+	Addrs    []SimpleAddress  // slice, string repr
+	TopAddrs [3]SimpleAddress // array, string repr
+}
+
+// CrossPkgPointerSlice: []*AminoMarshaler where the element type lives in
+// a different package and has a packed (non-ByteLength) repr. Without the
+// gen_marshal.go:442 fix, generated code emits `new(SmallCount)` (bare name)
+// which fails to compile in the tests package.
+
+type CrossPkgPointerSlice struct {
+	Counts []*crosspkg.SmallCount
+}
+
+// FixedStringArrayStruct: a struct with a `[4]string` field — a fixed-size
+// array of ByteLength-typed elements (decoded as unpacked-list entries).
+// Exercises the unpacked-list-array short-input rejection rule: the
+// generator must reject wire input that provides fewer than N entries,
+// matching reflect (binary_decode.go:625-644).
+type FixedStringArrayStruct struct {
+	Names [4]string
+}
+
+// ByteArraySliceStruct: a struct with a `[][8]byte` field. Each element is
+// a fixed-size 8-byte array, decoded as a list element via
+// writePrimitiveDecodeFrom's Array+Uint8 branch. Exercises the byte-array
+// element length check: the generator must enforce that the decoded
+// payload length matches the array length, mirroring reflect
+// (binary_decode.go:551-555).
+type ByteArraySliceStruct struct {
+	Items [][8]byte
+}
+
+// StructWithStringRepr is a Go struct whose MarshalAmino returns a string.
+// Used to exercise the "struct-pointer needs nil_elements" rule for list
+// elements whose Go kind is Struct but repr kind is String (Typ3ByteLength,
+// so unpacked list encoding is used). The generator must key off
+// `einfo.Type.Kind() == Struct` (Go kind), not the repr kind — matching
+// reflect at binary_encode.go:399.
+type StructWithStringRepr struct {
+	Name string
+}
+
+func (s StructWithStringRepr) MarshalAmino() (string, error) { return s.Name, nil }
+func (s *StructWithStringRepr) UnmarshalAmino(r string) error {
+	s.Name = r
+	return nil
+}
+
+// StructPtrSliceWithStringRepr exercises the list-element nil_elements
+// rule for `[]*X` where X is a Go struct with non-struct (string) repr.
+// If `ertIsStruct` were keyed off `einfo.ReprType.Type.Kind()` (string,
+// false), the generator would silently encode nil entries as 0x00
+// sentinels. Correct behavior: key off `einfo.Type.Kind() == Struct`
+// (Go kind, true) and reject nil entries without a `nil_elements` tag —
+// matching reflect.
+type StructPtrSliceWithStringRepr struct {
+	Items []*StructWithStringRepr // no nil_elements tag
+}
+
+// StructUint8ReprSliceStruct: exercises the unpacked-list packed-branch
+// bare-byte (beOptionByte) emission for AminoMarshaler-struct elements
+// whose repr is uint8. Reflect detects this via beOptionByte at
+// binary_encode.go:165 and emits EncodeByte (1 byte). Without the
+// generator's bare-byte handling at this site, writePrimitiveEncode
+// would emit `PrependUvarint(buf, offset, uint64(elem))` against a
+// struct-typed accessor — a Go compile error AND a wire divergence
+// (uvarint of byte ≥128 is 2 bytes; reflect emits 1 bare byte).
+//
+// Mirror of AminoMarshalerStruct7 (top-level repr-bytes) but at the
+// struct-field position, where writeUnpackedListMarshal handles the
+// list rather than writePackedSliceReprMarshal.
+type StructUint8ReprSliceStruct struct {
+	Vals []ReprElem7
+}
+
+// CrossPkgBoxedRepr: a same-package AminoMarshaler whose repr is a struct
+// in a different package. Without the gen_unmarshal.go:72 fix, generated
+// code declares `var repr Inner` (bare name) which fails to compile.
+
+type CrossPkgBoxedRepr struct {
+	Val int64
+}
+
+func (c CrossPkgBoxedRepr) MarshalAmino() (crosspkg.Inner, error) {
+	return crosspkg.Inner{N: c.Val}, nil
+}
+
+func (c *CrossPkgBoxedRepr) UnmarshalAmino(r crosspkg.Inner) error {
+	c.Val = r.N
+	return nil
+}
+
+// ----------------------------------------
+
+type ComplexSt struct {
+	PrField PrimitivesStruct
+	ArField ArraysStruct
+	SlField SlicesStruct
+	PtField PointersStruct
+}
+
+type EmbeddedSt1 struct {
+	PrimitivesStruct
+}
+
+type EmbeddedSt2 struct {
+	PrimitivesStruct
+	ArraysStruct
+	SlicesStruct
+	PointersStruct
+}
+
+type EmbeddedSt3 struct {
+	*PrimitivesStruct
+	*ArraysStruct
+	*SlicesStruct
+	*PointersStruct
+	*EmptyStruct
+}
+
+type EmbeddedSt4 struct {
+	Foo1 int
+	PrimitivesStruct
+	Foo2              string
+	ArraysStructField ArraysStruct
+	Foo3              []byte
+	SlicesStruct
+	Foo4                bool
+	PointersStructField PointersStruct
+	Foo5                uint
+}
+
+type EmbeddedSt5 struct {
+	Foo1 int
+	*PrimitivesStruct
+	Foo2              string
+	ArraysStructField *ArraysStruct
+	Foo3              []byte
+	*SlicesStruct
+	Foo4                bool
+	PointersStructField *PointersStruct
+	Foo5                uint
+}
+
+var StructTypes = []any{
+	(*EmptyStruct)(nil),
+	(*PrimitivesStruct)(nil),
+	(*ShortArraysStruct)(nil),
+	(*ArraysStruct)(nil),
+	(*ArraysArraysStruct)(nil),
+	(*SlicesStruct)(nil),
+	(*SlicesSlicesStruct)(nil),
+	(*PointersStruct)(nil),
+	(*PointerSlicesStruct)(nil),
+	// (*NestedPointersStruct)(nil),
+	(*ComplexSt)(nil),
+	(*EmbeddedSt1)(nil),
+	(*EmbeddedSt2)(nil),
+	(*EmbeddedSt3)(nil),
+	(*EmbeddedSt4)(nil),
+	(*EmbeddedSt5)(nil),
+	(*AminoMarshalerStruct1)(nil),
+	(*AminoMarshalerStruct2)(nil),
+	(*AminoMarshalerStruct3)(nil),
+	(*AminoMarshalerInt4)(nil),
+	(*AminoMarshalerInt5)(nil),
+	(*AminoMarshalerStruct6)(nil),
+	(*AminoMarshalerStruct7)(nil),
+	// GnoVM-inspired condensed types (no genproto pbbindings,
+	// but tested by genproto2 via PBMessager2).
+	(*FuzzStructInfo)(nil),
+	(*FuzzBlock)(nil),
+	(*FuzzDeepNest)(nil),
+	(*FuzzPtrNest)(nil),
+	(*FuzzUnsafeFloat)(nil),
+	(*FuzzFixedInt)(nil),
+	(*FuzzContainsAminoMarshaler)(nil),
+	// AminoMarshaler list element types (slice/array of AminoMarshaler with
+	// various repr kinds). Exercises gen_marshal/gen_unmarshal/gen_size fixes.
+	(*ContainerWithAminoLists)(nil),
+	(*StructPtrSliceWithStringRepr)(nil),
+	(*ByteArraySliceStruct)(nil),
+	(*FixedStringArrayStruct)(nil),
+	(*StructUint8ReprSliceStruct)(nil),
+	// Cross-package AminoMarshaler: verifies generated code uses qualified
+	// type names (e.g. `var repr crosspkg.Inner`). CrossPkgPointerSlice is
+	// excluded from property fuzz because random nil elements in a
+	// pointer-slice without nil_elements tag yield lossy null-vs-zero JSON
+	// roundtrips; it is covered by an explicit TestCrossPkgPointerSliceRoundtrip.
+	(*CrossPkgBoxedRepr)(nil),
+	// Interface-heavy benchmark type.
+	(*InterfaceHeavy)(nil),
+}
+
+// AminoTagTypes are struct types that use amino-specific encoding tags
+// (write_empty, nil_elements) with no proto3 equivalent. These need a
+// tailored test that skips the proto.Marshal byte comparison.
+var AminoTagTypes = []any{
+	(*FuzzWriteEmpty)(nil),
+	(*FuzzNilElements)(nil),
+}
+
+// ----------------------------------------
+// Type definition types
+
+// This will be encoded as
+// message SomeName { int64 val = 1; }
+type IntDef int
+
+// This will be encoded as
+// message SomeName { repeated int val = 1; }
+type IntAr [4]int
+
+// This will be encoded as
+// message SomeName { repeated int val = 1; }
+type IntSl []int
+
+// This will be encoded as
+// message SomeName { bytes val = 1; }
+type ByteAr [4]byte
+
+// This will be encoded as
+// message SomeName { bytes val = 1; }
+type ByteSl []byte
+
+type PrimitivesStructDef PrimitivesStruct
+
+// This will be encoded as
+// message SomeName { repeated PrimitivesStruct val = 1; }
+type PrimitivesStructSl []PrimitivesStruct
+
+// This will be encoded as
+// message SomeName { repeated PrimitivesStruct val = 1; }
+type PrimitivesStructAr [2]PrimitivesStruct
+
+var DefTypes = []any{
+	(*IntDef)(nil),
+	(*IntAr)(nil),
+	(*IntSl)(nil),
+	(*ByteAr)(nil),
+	(*ByteSl)(nil),
+	(*PrimitivesStructSl)(nil),
+	(*PrimitivesStructDef)(nil),
+}
+
+// ----------------------------------------
+// Register/Interface test types
+
+type Interface1 interface {
+	AssertInterface1()
+}
+
+type Interface2 interface {
+	AssertInterface2()
+}
+
+type Concrete1 struct{}
+
+func (Concrete1) AssertInterface1() {}
+func (Concrete1) AssertInterface2() {}
+
+// ConcreteRecursive implements Interface1 and has an Interface1 field,
+// allowing unbounded nesting for depth-limit testing.
+type ConcreteRecursive struct {
+	Inner Interface1
+}
+
+func (ConcreteRecursive) AssertInterface1() {}
+
+type Concrete2 struct{}
+
+func (Concrete2) AssertInterface1() {}
+func (Concrete2) AssertInterface2() {}
+
+// Special case: this concrete implementation (of Interface1) is a type definition.
+type ConcreteTypeDef [4]byte
+
+func (ConcreteTypeDef) AssertInterface1() {}
+
+// Ideally, user's of amino should refrain from using the above
+// but wrap actual values in structs; e.g. like:
+type ConcreteWrappedBytes struct {
+	Value []byte
+}
+
+func (ConcreteWrappedBytes) AssertInterface1() {}
+
+// Yet another special case: Field could be a type alias (should not be wrapped).
+type InterfaceFieldsStruct struct {
+	F1 Interface1
+	F2 Interface1
+	F3 any
+	F4 any
+}
+
+func (*InterfaceFieldsStruct) AssertInterface1() {}
+
+// ----------------------------------------
+// Reserved-field fixtures for amino reserved-field migration tests
+// (see genproto2/gen_unmarshal_reserved_test.go).
+//
+// These two types model a V1→V2 migration of a struct with three fields
+// (A int32 at fnum 1, B int32 at fnum 2, C string at fnum 3):
+//
+//	FixtureV2Reserved — CORRECT migration: B was removed and replaced with
+//	a `_ struct{} `amino:"reserved"`` placeholder so C's fnum 3 is preserved
+//	and old wire bytes carrying B at fnum 2 can still be decoded (the
+//	generator emits a per-typ3 skip stub at the reserved fnum).
+//
+//	FixtureV2Shifted — BAD migration: B was simply deleted with no
+//	placeholder. Amino auto-numbers fields by source order, so C silently
+//	slides from fnum 3 to fnum 2; old wire bytes hit a typ3 mismatch.
+type FixtureV2Reserved struct {
+	A int32    // fnum 1
+	_ struct{} `amino:"reserved"` // fnum 2 — was: B int32
+	C string   // fnum 3
+}
+
+type FixtureV2Shifted struct {
+	A int32  // fnum 1
+	C string // fnum 2 (SHIFTED — the bug Neg #1 catches)
+}

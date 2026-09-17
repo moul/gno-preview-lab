@@ -1,0 +1,23 @@
+// PKGPATH: gno.land/r/test
+package test
+
+type MyStruct struct{}
+
+func (ms MyStruct) Panic() {
+	panic("panic")
+}
+
+func main(cur realm) {
+	ms := MyStruct{}
+	ms.Panic()
+}
+
+// Error:
+// panic
+
+// Stacktrace:
+// panic: panic
+// ms<VPBlock(1,1)>.Panic()
+//     gno.land/r/test/zrealm_panic.gno:7
+// main<VPBlock(1,1)>(&(struct{("g148esskg7wzxxw6axwv4j5nkgjzdp6v4zmy3pwc" .uverse.address),("gno.land/r/test" string),(&(struct{("" .uverse.address),("" string),(undefined)} .uverse..grealm) *.uverse..grealm)} .uverse..grealm))
+//     gno.land/r/test/zrealm_panic.gno:12

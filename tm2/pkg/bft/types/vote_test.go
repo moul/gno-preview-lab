@@ -1,0 +1,365 @@
+package types
+
+import (
+	"math"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/gnolang/gno/tm2/pkg/amino"
+	"github.com/gnolang/gno/tm2/pkg/crypto"
+	"github.com/gnolang/gno/tm2/pkg/crypto/ed25519"
+	"github.com/gnolang/gno/tm2/pkg/crypto/tmhash"
+)
+
+func examplePrevote() *Vote {
+	return exampleVote(byte(PrevoteType))
+}
+
+func examplePrecommit() *Vote {
+	return exampleVote(byte(PrecommitType))
+}
+
+func exampleVote(t byte) *Vote {
+	stamp, err := time.Parse(TimeFormat, "2017-12-25T03:00:01.234Z")
+	if err != nil {
+		panic(err)
+	}
+
+	return &Vote{
+		Type:      SignedMsgType(t),
+		Height:    12345,
+		Round:     2,
+		Timestamp: stamp,
+		BlockID: BlockID{
+			Hash: tmhash.Sum([]byte("blockID_hash")),
+			PartsHeader: PartSetHeader{
+				Total: 1000,
+				Hash:  tmhash.Sum([]byte("blockID_part_set_header_hash")),
+			},
+		},
+		ValidatorAddress: crypto.AddressFromPreimage([]byte("validator_address")),
+		ValidatorIndex:   56789,
+	}
+}
+
+// Ensure that Vote and CommitSig have the same encoding.
+// This ensures using CommitSig isn't a breaking change.
+// This test will fail and can be removed once CommitSig contains only sigs and
+// timestamps.
+func TestVoteEncoding(t *testing.T) {
+	t.Parallel()
+
+	vote := examplePrecommit()
+	commitSig := vote.CommitSig()
+	bz1 := amino.MustMarshal(vote)
+	bz2 := amino.MustMarshal(commitSig)
+	assert.Equal(t, bz1, bz2)
+}
+
+func TestVoteSignable(t *testing.T) {
+	t.Parallel()
+
+	vote := examplePrecommit()
+	signBytes := vote.SignBytes("test_chain_id")
+
+	expected, err := amino.MarshalSized(CanonicalizeVote("test_chain_id", vote))
+	require.NoError(t, err)
+
+	require.Equal(t, expected, signBytes, "Got unexpected sign bytes for Vote.")
+}
+
+func TestVoteSignBytesTestVectors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		chainID string
+		vote    *Vote
+		want    []byte
+	}{
+		0: {
+			"", &Vote{},
+			// NOTE: Height and Round are skipped here. This case needs to be considered while parsing.
+			[]byte{0xd, 0x2a, 0xb, 0x8, 0x80, 0x92, 0xb8, 0xc3, 0x98, 0xfe, 0xff, 0xff, 0xff, 0x1},
+		},
+		// with proper (fixed size) height and round (PreCommit):
+		1: {
+			"", &Vote{Height: 1, Round: 1, Type: PrecommitType},
+			[]byte{
+				0x21,                                   // length
+				0x8,                                    // (field_number << 3) | wire_type
+				0x2,                                    // PrecommitType
+				0x11,                                   // (field_number << 3) | wire_type
+				0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, // height
+				0x19,                                   // (field_number << 3) | wire_type
+				0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, // round
+				0x2a, // (field_number << 3) | wire_type
+				// remaining fields (timestamp):
+				0xb, 0x8, 0x80, 0x92, 0xb8, 0xc3, 0x98, 0xfe, 0xff, 0xff, 0xff, 0x1,
+			},
+		},
+		// with proper (fixed size) height and round (PreVote):
+		2: {
+			"", &Vote{Height: 1, Round: 1, Type: PrevoteType},
+			[]byte{
+				0x21,                                   // length
+				0x8,                                    // (field_number << 3) | wire_type
+				0x1,                                    // PrevoteType
+				0x11,                                   // (field_number << 3) | wire_type
+				0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, // height
+				0x19,                                   // (field_number << 3) | wire_type
+				0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, // round
+				0x2a, // (field_number << 3) | wire_type
+				// remaining fields (timestamp):
+				0xb, 0x8, 0x80, 0x92, 0xb8, 0xc3, 0x98, 0xfe, 0xff, 0xff, 0xff, 0x1,
+			},
+		},
+		3: {
+			"", &Vote{Height: 1, Round: 1},
+			[]byte{
+				0x1f,                                   // length
+				0x11,                                   // (field_number << 3) | wire_type
+				0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, // height
+				0x19,                                   // (field_number << 3) | wire_type
+				0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, // round
+				// remaining fields (timestamp):
+				0x2a,
+				0xb, 0x8, 0x80, 0x92, 0xb8, 0xc3, 0x98, 0xfe, 0xff, 0xff, 0xff, 0x1,
+			},
+		},
+		// containing non-empty chain_id:
+		4: {
+			"test_chain_id", &Vote{Height: 1, Round: 1},
+			[]byte{
+				0x2e,                                   // length
+				0x11,                                   // (field_number << 3) | wire_type
+				0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, // height
+				0x19,                                   // (field_number << 3) | wire_type
+				0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, // round
+				// remaining fields:
+				0x2a,                                                                // (field_number << 3) | wire_type
+				0xb, 0x8, 0x80, 0x92, 0xb8, 0xc3, 0x98, 0xfe, 0xff, 0xff, 0xff, 0x1, // timestamp
+				0x32, // (field_number << 3) | wire_type
+				0xd, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x63, 0x68, 0x61, 0x69, 0x6e, 0x5f, 0x69, 0x64,
+			}, // chainID
+		},
+		// Edge value: math.MinInt64 height and -1 round. Locks down fixed64
+		// encoding for the most-negative int64 (0x80 high byte, seven zeros)
+		// and for -1 (all 0xff bytes) — a silent endianness or sign-extension
+		// regression in the fixed64 path would break every precommit signature.
+		5: {
+			"", &Vote{Type: PrecommitType, Height: math.MinInt64, Round: -1},
+			[]byte{
+				0x21,       // length
+				0x08, 0x02, // Type = PrecommitType
+				0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // height = MinInt64 (LE)
+				0x19, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // round = -1 (LE)
+				0x2a, 0x0b, // timestamp field + length
+				0x08, 0x80, 0x92, 0xb8, 0xc3, 0x98, 0xfe, 0xff, 0xff, 0xff, 0x01,
+			},
+		},
+		// Edge value: math.MaxInt64 for both height and round.
+		6: {
+			"", &Vote{Type: PrecommitType, Height: math.MaxInt64, Round: math.MaxInt64},
+			[]byte{
+				0x21,       // length
+				0x08, 0x02, // Type = PrecommitType
+				0x11, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, // height = MaxInt64 (LE)
+				0x19, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, // round = MaxInt64 (LE)
+				0x2a, 0x0b, // timestamp
+				0x08, 0x80, 0x92, 0xb8, 0xc3, 0x98, 0xfe, 0xff, 0xff, 0xff, 0x01,
+			},
+		},
+		// Height = 0, Round = 0: amino omits zero-valued fields (no write_empty
+		// override on fixed64). If a future change forced fixed-width fields
+		// to always emit 8 bytes regardless of value, sign-bytes would diverge
+		// from every historical precommit signature — this case locks that in.
+		7: {
+			"", &Vote{Type: PrecommitType, Height: 0, Round: 0},
+			[]byte{
+				0x0f,       // length (much shorter — no Height/Round emitted)
+				0x08, 0x02, // Type = PrecommitType
+				0x2a, 0x0b, // timestamp
+				0x08, 0x80, 0x92, 0xb8, 0xc3, 0x98, 0xfe, 0xff, 0xff, 0xff, 0x01,
+			},
+		},
+	}
+	for i, tc := range tests {
+		got := tc.vote.SignBytes(tc.chainID)
+		require.Equal(t, tc.want, got, "test case #%v: got unexpected sign bytes for Vote.", i)
+	}
+}
+
+func TestVoteProposalNotEq(t *testing.T) {
+	t.Parallel()
+
+	cv := CanonicalizeVote("", &Vote{Height: 1, Round: 1})
+	p := CanonicalizeProposal("", &Proposal{Height: 1, Round: 1})
+	vb, err := amino.MarshalSized(cv)
+	require.NoError(t, err)
+	pb, err := amino.MarshalSized(p)
+	require.NoError(t, err)
+	require.NotEqual(t, vb, pb)
+}
+
+func TestVoteVerifySignature(t *testing.T) {
+	t.Parallel()
+
+	privVal := NewMockPV()
+	pubkey := privVal.PubKey()
+
+	vote := examplePrecommit()
+	signBytes := vote.SignBytes("test_chain_id")
+
+	// sign it
+	err := privVal.SignVote("test_chain_id", vote)
+	require.NoError(t, err)
+
+	// verify the same vote
+	valid := pubkey.VerifyBytes(vote.SignBytes("test_chain_id"), vote.Signature)
+	require.True(t, valid)
+
+	// serialize, deserialize and verify again....
+	precommit := new(Vote)
+	bs, err := amino.MarshalSized(vote)
+	require.NoError(t, err)
+	err = amino.UnmarshalSized(bs, &precommit)
+	require.NoError(t, err)
+
+	// verify the transmitted vote
+	newSignBytes := precommit.SignBytes("test_chain_id")
+	require.Equal(t, string(signBytes), string(newSignBytes))
+	valid = pubkey.VerifyBytes(newSignBytes, precommit.Signature)
+	require.True(t, valid)
+}
+
+func TestIsVoteTypeValid(t *testing.T) {
+	t.Parallel()
+
+	tc := []struct {
+		name string
+		in   SignedMsgType
+		out  bool
+	}{
+		{"Prevote", PrevoteType, true},
+		{"Precommit", PrecommitType, true},
+		{"InvalidType", SignedMsgType(0x3), false},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(st *testing.T) {
+			st.Parallel()
+
+			if rs := IsVoteTypeValid(tt.in); rs != tt.out {
+				t.Errorf("Got unexpected Vote type. Expected:\n%v\nGot:\n%v", rs, tt.out)
+			}
+		})
+	}
+}
+
+func TestVoteVerify(t *testing.T) {
+	t.Parallel()
+
+	privVal := NewMockPV()
+	pubkey := privVal.PubKey()
+
+	vote := examplePrevote()
+	vote.ValidatorAddress = pubkey.Address()
+
+	err := vote.Verify("test_chain_id", ed25519.GenPrivKey().PubKey())
+	if assert.Error(t, err) {
+		assert.Equal(t, ErrVoteInvalidValidatorAddress, err)
+	}
+
+	err = vote.Verify("test_chain_id", pubkey)
+	if assert.Error(t, err) {
+		assert.Equal(t, ErrVoteInvalidSignature, err)
+	}
+}
+
+func TestMaxVoteBytes(t *testing.T) {
+	t.Parallel()
+
+	// time is varint encoded so need to pick the max.
+	// year int, month Month, day, hour, min, sec, nsec int, loc *Location
+	timestamp := time.Date(math.MaxInt64, 0, 0, 0, 0, 0, math.MaxInt64, time.UTC)
+
+	vote := &Vote{
+		ValidatorAddress: crypto.AddressFromPreimage([]byte("validator_address")),
+		ValidatorIndex:   math.MaxInt64,
+		Height:           math.MaxInt64,
+		Round:            math.MaxInt64,
+		Timestamp:        timestamp,
+		Type:             PrevoteType,
+		BlockID: BlockID{
+			Hash: tmhash.Sum([]byte("blockID_hash")),
+			PartsHeader: PartSetHeader{
+				// Canonical PartSetHeader.Total is uint32 (matches upstream
+				// Tendermint v0.34). math.MaxUint32 is the largest value that
+				// canonicalizes — anything larger panics in
+				// CanonicalizePartSetHeader's bounds check.
+				Total: math.MaxUint32,
+				Hash:  tmhash.Sum([]byte("blockID_part_set_header_hash")),
+			},
+		},
+	}
+
+	privVal := NewMockPV()
+	err := privVal.SignVote("test_chain_id", vote)
+	require.NoError(t, err)
+
+	bz, err := amino.MarshalSized(vote)
+	require.NoError(t, err)
+
+	assert.EqualValues(t, MaxVoteBytes, len(bz))
+}
+
+func TestVoteString(t *testing.T) {
+	t.Parallel()
+
+	str := examplePrecommit().String()
+	expected := `Vote{56789:6AF1F4111082 12345/02/2(Precommit) 8B01023386C3 000000000000 @ 2017-12-25T03:00:01.234Z}`
+	if str != expected {
+		t.Errorf("Got unexpected string for Vote. Expected:\n%v\nGot:\n%v", expected, str)
+	}
+
+	str2 := examplePrevote().String()
+	expected = `Vote{56789:6AF1F4111082 12345/02/1(Prevote) 8B01023386C3 000000000000 @ 2017-12-25T03:00:01.234Z}`
+	if str2 != expected {
+		t.Errorf("Got unexpected string for Vote. Expected:\n%v\nGot:\n%v", expected, str2)
+	}
+}
+
+func TestVoteValidateBasic(t *testing.T) {
+	t.Parallel()
+
+	privVal := NewMockPV()
+
+	testCases := []struct {
+		testName     string
+		malleateVote func(*Vote)
+		expectErr    bool
+	}{
+		{"Good Vote", func(v *Vote) {}, false},
+		{"Negative Height", func(v *Vote) { v.Height = -1 }, true},
+		{"Negative Round", func(v *Vote) { v.Round = -1 }, true},
+		{"Invalid BlockID", func(v *Vote) { v.BlockID = BlockID{[]byte{1, 2, 3}, PartSetHeader{10, []byte("blockparts")}} }, true},
+		{"Invalid Address", func(v *Vote) { v.ValidatorAddress = crypto.Address{} }, true},
+		{"Invalid ValidatorIndex", func(v *Vote) { v.ValidatorIndex = -1 }, true},
+		{"Invalid Signature", func(v *Vote) { v.Signature = nil }, true},
+		{"Too big Signature", func(v *Vote) { v.Signature = make([]byte, MaxSignatureSize+1) }, true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.testName, func(t *testing.T) {
+			t.Parallel()
+
+			vote := examplePrecommit()
+			err := privVal.SignVote("test_chain_id", vote)
+			require.NoError(t, err)
+			tc.malleateVote(vote)
+			assert.Equal(t, tc.expectErr, vote.ValidateBasic() != nil, "Validate Basic had an unexpected result")
+		})
+	}
+}
