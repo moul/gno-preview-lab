@@ -107,3 +107,5 @@ func (o *Ownable) Owner() address {
 	}
 	return o.owner
 }
+
+// preview-lab: touched to exercise the reverse dependency walk.
