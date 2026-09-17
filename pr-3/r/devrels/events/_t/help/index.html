@@ -35,16 +35,16 @@
   <link rel="icon" href="../../../../../public/favicon.ico" type="image/x-icon" />
 
   
-  <meta name="robots" content="index, follow" />
+  <meta name="robots" content="noindex, nofollow">
 
   
   <link rel="stylesheet" href="../../../../../public/_chroma/style.css" />
 
   
-  <link rel="stylesheet" href="../../../../../public/main.css?v=20260917102838" />
+  <link rel="stylesheet" href="../../../../../public/main.css?v=20260917113545" />
 
   
-  <meta name="gnoconnect:rpc" content="tcp://127.0.0.1:26657" />
+  <meta name="gnoconnect:rpc" content="tcp://127.0.0.1:18899" />
   <meta name="gnoconnect:chainid" content="dev" />
 </head>
 <body>
@@ -477,7 +477,7 @@
               </svg>
               <div class="item-content">
                 <span class="item-label">RPC Address</span>
-                <span class="item-value">tcp://127.0.0.1:26657</span>
+                <span class="item-value">tcp://127.0.0.1:18899</span>
               </div>
             </div>
           </div>
@@ -821,10 +821,10 @@
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/devrels/events" -func "AddEvent" -args $'<span data-action-function-target="arg" data-action-function-arg-value="name"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="description"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="link"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="location"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="startTime"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="endTime"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AddEvent" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/devrels/events" -func "AddEvent" -args $'<span data-action-function-target="arg" data-action-function-arg-value="name"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="description"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="link"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="location"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="startTime"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="endTime"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-AddEvent" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/devrels/events" -func "AddEvent" -args $'<span data-action-function-target="arg" data-action-function-arg-value="name"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="description"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="link"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="location"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="startTime"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="endTime"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -932,10 +932,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/devrels/events" -func "DeleteEvent" -args $'<span data-action-function-target="arg" data-action-function-arg-value="id"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-DeleteEvent" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/devrels/events" -func "DeleteEvent" -args $'<span data-action-function-target="arg" data-action-function-arg-value="id"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-DeleteEvent" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/devrels/events" -func "DeleteEvent" -args $'<span data-action-function-target="arg" data-action-function-arg-value="id"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -1103,10 +1103,10 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 # and avoid trusting any computer connected to the internet,
 # as your private keys could be exposed.
 
-gnokey maketx call -pkgpath "gno.land/r/devrels/events" -func "EditEvent" -args $'<span data-action-function-target="arg" data-action-function-arg-value="id"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="name"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="description"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="link"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="location"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="startTime"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="endTime"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:26657" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-EditEvent" class="u-inline">gnokey query -remote "tcp://127.0.0.1:26657" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
+gnokey maketx call -pkgpath "gno.land/r/devrels/events" -func "EditEvent" -args $'<span data-action-function-target="arg" data-action-function-arg-value="id"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="name"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="description"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="link"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="location"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="startTime"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="endTime"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -chainid "dev" -remote "tcp://127.0.0.1:18899" <span data-action-function-target="address">ADDRESS</span></span><span data-action-function-target="mode" data-action-function-mode-value="secure" data-copy-target="action-function-EditEvent" class="u-inline">gnokey query -remote "tcp://127.0.0.1:18899" auth/accounts/<span data-action-function-target="address">ADDRESS</span>
 gnokey maketx call -pkgpath "gno.land/r/devrels/events" -func "EditEvent" -args $'<span data-action-function-target="arg" data-action-function-arg-value="id"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="name"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="description"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="link"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="location"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="startTime"></span>' -args $'<span data-action-function-target="arg" data-action-function-arg-value="endTime"></span>' -gas-fee 1000000ugnot -gas-wanted 1_000_000_000 -send "<span data-action-function-target="send-code"></span>" -broadcast=false <span data-action-function-target="address">ADDRESS</span> > call.tx
 gnokey sign -tx-path call.tx -chainid "dev" -account-number ACCOUNTNUMBER -account-sequence SEQUENCENUMBER <span data-action-function-target="address">ADDRESS</span>
-gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
+gnokey broadcast -remote "tcp://127.0.0.1:18899" call.tx
   </span></code></pre>
 </div>
 
@@ -1200,7 +1200,7 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
         </button>
         
         
-        <pre><code><span data-copy-target="action-function-Render">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:26657</span>" -data "gno.land/r/devrels/events.Render(<span data-action-function-target="arg" data-action-function-arg-value="path"></span>)"</span></code></pre>
+        <pre><code><span data-copy-target="action-function-Render">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:18899</span>" -data "gno.land/r/devrels/events.Render(<span data-action-function-target="arg" data-action-function-arg-value="path"></span>)"</span></code></pre>
         
         
       </div>
@@ -1298,7 +1298,7 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
         </button>
         
         
-        <pre><code><span data-copy-target="action-function-RenderEventWidget">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:26657</span>" -data "gno.land/r/devrels/events.RenderEventWidget(<span data-action-function-target="arg" data-action-function-arg-value="eventsToRender"></span>)"</span></code></pre>
+        <pre><code><span data-copy-target="action-function-RenderEventWidget">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:18899</span>" -data "gno.land/r/devrels/events.RenderEventWidget(<span data-action-function-target="arg" data-action-function-arg-value="eventsToRender"></span>)"</span></code></pre>
         
         
       </div>
@@ -1393,7 +1393,7 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
         </button>
         
         
-        <pre><code><span data-copy-target="action-function-GetEventByID">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:26657</span>" -data "gno.land/r/devrels/events.GetEventByID(<span data-action-function-target="arg" data-action-function-arg-value="id"></span>)"</span></code></pre>
+        <pre><code><span data-copy-target="action-function-GetEventByID">gnokey query vm/qeval -remote "<span data-action-function-target="remote">tcp://127.0.0.1:18899</span>" -data "gno.land/r/devrels/events.GetEventByID(<span data-action-function-target="arg" data-action-function-arg-value="id"></span>)"</span></code></pre>
         
         
       </div>
@@ -1521,7 +1521,7 @@ gnokey broadcast -remote "tcp://127.0.0.1:26657" call.tx
 </footer>
 
 
-<script type="module" src="../../../../../public/js/controller.js?v=20260917102838"></script>
-<script type="module" src="../../../../../public/js/index.js?v=20260917102838"></script></body>
+<script type="module" src="../../../../../public/js/controller.js?v=20260917113545"></script>
+<script type="module" src="../../../../../public/js/index.js?v=20260917113545"></script></body>
 
 </html>
